@@ -1,4 +1,4 @@
-// Market Pulse V1.4.4 — Capital.com DEMO + D1 Persistence Regime Fix. READ ONLY. No trading endpoints.
+// Market Pulse V1.5.1 — Capital.com DEMO + D1 Paper Matrix Engine. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.4.4';
+const VERSION = '1.5.1';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -578,6 +578,146 @@ async function persistenceAll(env: Env) {
   return{success:true,...INFO,module:'PERSISTENCE_ENGINE_ALL',assets,trading:'DISABLED',execution:'NONE'};
 }
 
+
+
+const PAPER_CFG = {
+  entry_score: 60,
+  persistence_score: 35,
+  min_regime_streak: 3,
+  min_abs_acceleration: 3,
+  notional: 100
+} as const;
+const PAPER_MATRIX = [
+  {id:'A',tp_pct:0.15,sl_pct:0.10,max_hold_minutes:30},
+  {id:'B',tp_pct:0.20,sl_pct:0.15,max_hold_minutes:30},
+  {id:'C',tp_pct:0.25,sl_pct:0.15,max_hold_minutes:45},
+  {id:'D',tp_pct:0.30,sl_pct:0.20,max_hold_minutes:45},
+  {id:'E',tp_pct:0.35,sl_pct:0.25,max_hold_minutes:60},
+  {id:'F',tp_pct:0.50,sl_pct:0.30,max_hold_minutes:60}
+] as const;
+
+async function ensurePaperSchema(env: Env) {
+  if(!env.DB)throw new Fault('D1_BINDING_MISSING',500);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_observations (
+    id TEXT PRIMARY KEY, epic TEXT NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL,
+    entry_time TEXT NOT NULL, entry_price REAL NOT NULL, entry_combined_score REAL,
+    entry_persistence_score REAL, entry_regime TEXT, entry_regime_streak INTEGER,
+    entry_acceleration REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_paper_obs_epic_status ON paper_observations(epic,status)`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_matrix_trades (
+    id TEXT PRIMARY KEY, observation_id TEXT NOT NULL, variant TEXT NOT NULL, epic TEXT NOT NULL,
+    side TEXT NOT NULL, status TEXT NOT NULL, entry_time TEXT NOT NULL, entry_price REAL NOT NULL,
+    tp_pct REAL NOT NULL, sl_pct REAL NOT NULL, max_hold_minutes INTEGER NOT NULL,
+    exit_time TEXT, exit_price REAL, exit_reason TEXT, pnl_pct REAL, pnl_value REAL,
+    max_favorable_pct REAL DEFAULT 0, max_adverse_pct REAL DEFAULT 0,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_paper_matrix_obs ON paper_matrix_trades(observation_id)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_paper_matrix_status ON paper_matrix_trades(status,epic)`).run();
+}
+function paperMovePct(side:string, entry:number, price:number){
+  if(!entry||!price)return 0;
+  const raw=(price-entry)/entry*100;
+  return side==='LONG'?raw:-raw;
+}
+async function latestSnapshotRow(env: Env, epic:string){
+  return await env.DB.prepare(`SELECT captured_at,price,combined_score,combined_direction FROM market_snapshots WHERE epic=? ORDER BY captured_at DESC LIMIT 1`).bind(epic).first<Obj>();
+}
+function paperEntryDecision(snap:Obj,p:Obj){
+  const score=number(snap.combined_score), ps=number(p.persistence?.score), acc=number(p.persistence?.acceleration);
+  const bias=String(p.persistence?.bias??'NOT_READY'), streak=Number(p.regime_streak?.count??0);
+  if(score===null||ps===null||acc===null)return{eligible:false,reason:'NOT_READY'};
+  if(streak<PAPER_CFG.min_regime_streak)return{eligible:false,reason:'REGIME_STREAK_TOO_SHORT'};
+  if(score>=PAPER_CFG.entry_score&&ps>=PAPER_CFG.persistence_score&&bias==='BULLISH'&&acc>=PAPER_CFG.min_abs_acceleration)
+    return{eligible:true,side:'LONG',reason:'LONG_CONFIRMED'};
+  if(score<=-PAPER_CFG.entry_score&&ps<=-PAPER_CFG.persistence_score&&bias==='BEARISH'&&acc<=-PAPER_CFG.min_abs_acceleration)
+    return{eligible:true,side:'SHORT',reason:'SHORT_CONFIRMED'};
+  return{eligible:false,reason:'ENTRY_FILTER_NOT_MET'};
+}
+async function openMatrixObservation(env:Env, epic:string, side:string, snap:Obj, p:Obj){
+  const now=String(snap.captured_at??new Date().toISOString()), price=number(snap.price);
+  if(price===null)return null;
+  const oid=`${epic}|${now}|${side}`;
+  await env.DB.prepare(`INSERT OR IGNORE INTO paper_observations
+    (id,epic,side,status,entry_time,entry_price,entry_combined_score,entry_persistence_score,entry_regime,entry_regime_streak,entry_acceleration,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(oid,epic,side,'OPEN',now,price,number(snap.combined_score),number(p.persistence?.score),
+      String(p.persistence?.bias??'NOT_READY'),Number(p.regime_streak?.count??0),number(p.persistence?.acceleration),now,now).run();
+  for(const v of PAPER_MATRIX){
+    const id=`${oid}|${v.id}`;
+    await env.DB.prepare(`INSERT OR IGNORE INTO paper_matrix_trades
+      (id,observation_id,variant,epic,side,status,entry_time,entry_price,tp_pct,sl_pct,max_hold_minutes,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id,oid,v.id,epic,side,'OPEN',now,price,v.tp_pct,v.sl_pct,v.max_hold_minutes,now,now).run();
+  }
+  return oid;
+}
+async function updateMatrixTrade(env:Env,t:Obj,price:number,now:string){
+  const move=paperMovePct(String(t.side),Number(t.entry_price),price);
+  const fav=Math.max(number(t.max_favorable_pct)??0,move), adv=Math.min(number(t.max_adverse_pct)??0,move);
+  const age=(Date.parse(now)-Date.parse(String(t.entry_time)))/60000;
+  let reason:string|null=null;
+  if(move>=Number(t.tp_pct))reason='TAKE_PROFIT';
+  else if(move<=-Number(t.sl_pct))reason='STOP_LOSS';
+  else if(age>=Number(t.max_hold_minutes))reason='MAX_HOLD';
+  if(reason){
+    const pnl=PAPER_CFG.notional*(move/100);
+    await env.DB.prepare(`UPDATE paper_matrix_trades SET status='CLOSED',exit_time=?,exit_price=?,exit_reason=?,pnl_pct=?,pnl_value=?,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
+      .bind(now,price,reason,move,pnl,fav,adv,now,String(t.id)).run();
+    return true;
+  }
+  await env.DB.prepare(`UPDATE paper_matrix_trades SET max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
+    .bind(fav,adv,now,String(t.id)).run();
+  return false;
+}
+async function paperRun(env:Env){
+  await ensureSnapshotSchema(env);await ensurePaperSchema(env);
+  const actions:Obj[]=[];
+  for(const item of WATCHLIST){
+    const epic=item.epic,snap=await latestSnapshotRow(env,epic);
+    if(!snap){actions.push({epic,action:'SKIP',reason:'NO_SNAPSHOT'});continue;}
+    const price=number(snap.price); if(price===null){actions.push({epic,action:'SKIP',reason:'NO_PRICE'});continue;}
+    const now=String(snap.captured_at);
+    const openObs=await env.DB.prepare(`SELECT * FROM paper_observations WHERE epic=? AND status='OPEN' ORDER BY entry_time DESC LIMIT 1`).bind(epic).first<Obj>();
+    if(openObs){
+      const trades=await env.DB.prepare(`SELECT * FROM paper_matrix_trades WHERE observation_id=? AND status='OPEN'`).bind(String(openObs.id)).all();
+      let closed=0;
+      for(const t of (trades.results??[]) as Obj[])if(await updateMatrixTrade(env,t,price,now))closed++;
+      const left=await env.DB.prepare(`SELECT COUNT(*) c FROM paper_matrix_trades WHERE observation_id=? AND status='OPEN'`).bind(String(openObs.id)).first<Obj>();
+      if(Number(left?.c??0)===0)await env.DB.prepare(`UPDATE paper_observations SET status='CLOSED',updated_at=? WHERE id=?`).bind(now,String(openObs.id)).run();
+      actions.push({epic,action:'TRACK_MATRIX',observation_id:openObs.id,variants_open:Number(left?.c??0),variants_closed_now:closed});
+      continue;
+    }
+    const p=await persistenceForEpic(env,epic), decision=paperEntryDecision(snap,p);
+    if(decision.eligible){
+      const oid=await openMatrixObservation(env,epic,String(decision.side),snap,p);
+      actions.push({epic,action:'OPEN_MATRIX',observation_id:oid,side:decision.side,variants:PAPER_MATRIX.length,price});
+    }else actions.push({epic,action:'WAIT',reason:decision.reason,combined_score:number(snap.combined_score),persistence_score:number(p.persistence?.score),regime:p.persistence?.bias,streak:p.regime_streak?.count,acceleration:p.persistence?.acceleration});
+  }
+  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
+}
+async function paperStatus(env:Env){
+  await ensurePaperSchema(env);
+  const obs=await env.DB.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed FROM paper_observations`).first<Obj>();
+  const matrix=await env.DB.prepare(`SELECT variant,COUNT(*) trades,
+    SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    SUM(CASE WHEN status='CLOSED' AND pnl_pct<=0 THEN 1 ELSE 0 END) losses,
+    ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) avg_pnl_pct,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN max_favorable_pct END),4) avg_mfe_pct,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN max_adverse_pct END),4) avg_mae_pct
+    FROM paper_matrix_trades GROUP BY variant ORDER BY variant`).all();
+  const byAsset=await env.DB.prepare(`SELECT epic,variant,COUNT(*) trades,
+    SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value
+    FROM paper_matrix_trades GROUP BY epic,variant ORDER BY epic,variant`).all();
+  const recent=await env.DB.prepare(`SELECT * FROM paper_observations ORDER BY entry_time DESC LIMIT 20`).all();
+  return{success:true,...INFO,module:'PAPER_MATRIX_STATUS',config:PAPER_CFG,matrix_definitions:PAPER_MATRIX,
+    observations:obs??{},variants:matrix.results??[],by_asset:byAsset.results??[],recent_observations:recent.results??[],
+    trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
+}
+
 async function snapshotStatus(env: Env){
   await ensureSnapshotSchema(env);
   const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();
@@ -602,7 +742,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.4.4 · Capital.com · Persistence Regime Fix · 5m / 15m / 30m</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.5.1 · Capital.com · PAPER MATRIX ENGINE · No Orders</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -621,6 +761,8 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="run-snapshot-btn" type="button">💾 RUN SNAPSHOT</button>
     <button id="snapshot-status-btn" type="button">📚 SNAPSHOT STATUS</button>
     <button id="persistence-btn" type="button">📈 PERSISTENCE</button>
+    <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
+    <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -655,6 +797,8 @@ async function mpD1Call(path) {
 document.getElementById('run-snapshot-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-run'));
 document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-status'));
 document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Call('/api/persistence'));
+document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
+document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -690,7 +834,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -708,6 +852,8 @@ export default {
         const epic=(url.searchParams.get('epic')??'').trim();
         return json(epic?await persistenceForEpic(env,epic):await persistenceAll(env));
       }
+      if (url.pathname === '/api/paper-run') return json(await paperRun(env));
+      if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
@@ -730,24 +876,22 @@ export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil((async()=>{
       try {
-        const result=await snapshotRun(env);
+        const snapshot=await snapshotRun(env);
+        const paper=await paperRun(env);
         console.log(JSON.stringify({
           event:'MARKET_PULSE_CRON',
           version:VERSION,
           scheduled_time:event.scheduledTime,
-          success:result.success,
-          inserted:result.inserted,
-          duplicates:result.duplicates,
-          failed:result.failed
+          snapshot_success:snapshot.success,
+          inserted:snapshot.inserted,
+          duplicates:snapshot.duplicates,
+          failed:snapshot.failed,
+          paper_success:paper.success,
+          paper_actions:paper.actions?.map((x:Obj)=>({epic:x.epic,action:x.action}))
         }));
       } catch (error) {
         const detail=failure(error);
-        console.error(JSON.stringify({
-          event:'MARKET_PULSE_CRON_ERROR',
-          version:VERSION,
-          scheduled_time:event.scheduledTime,
-          ...detail
-        }));
+        console.error(JSON.stringify({event:'MARKET_PULSE_CRON_ERROR',version:VERSION,scheduled_time:event.scheduledTime,...detail}));
         throw error;
       }
     })());
