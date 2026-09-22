@@ -1,0 +1,15 @@
+{
+  "name": "market-pulse",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit --strict --target ES2022 --module ESNext --lib ES2022,DOM src/index.ts"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
