@@ -1,4 +1,4 @@
-// Market Pulse V1.1.1 — Capital.com DEMO dashboard and historical candles. No trading endpoints.
+// Market Pulse V1.2.0 — Capital.com DEMO signal engine. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -7,7 +7,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -271,7 +271,83 @@ async function candles(env: Env, epic: string, resolution: string) {
     latest_age_seconds: latest ? Math.round((now-latest.timestamp_ms)/1000) : null,
     history_stale: latest ? now-(latest.timestamp_ms+duration) > duration*2 : null,
     error: rows.length ? null : 'NO_VALID_CANDLES', candles: rows,
-    note: 'BID свещи. Затваряне по UTC начало + интервал и 2 секунди буфер. Пропуските не се запълват; могат да са извън пазарната сесия. Няма сигнали или сделки.'};
+    note: 'BID свещи. Затваряне по UTC начало + интервал и 2 секунди буфер. Пропуските не се запълват; могат да са извън пазарната сесия. /api/signal изчислява READ-ONLY сигнал само от затворени свещи; няма сделки.'};
+}
+
+
+function round(value: number | null, digits = 5): number | null {
+  if (value === null || !Number.isFinite(value)) return null;
+  const p = 10 ** digits;
+  return Math.round(value * p) / p;
+}
+function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)); }
+function emaSeries(values: number[], period: number): Array<number | null> {
+  const out: Array<number | null> = Array(values.length).fill(null);
+  if (values.length < period) return out;
+  let seed = 0;
+  for (let i=0;i<period;i++) seed += values[i];
+  let prev = seed / period;
+  out[period-1] = prev;
+  const k = 2 / (period + 1);
+  for (let i=period;i<values.length;i++) { prev = values[i] * k + prev * (1-k); out[i] = prev; }
+  return out;
+}
+function rsiSeries(values: number[], period = 14): Array<number | null> {
+  const out: Array<number | null> = Array(values.length).fill(null);
+  if (values.length <= period) return out;
+  let gains=0, losses=0;
+  for (let i=1;i<=period;i++) { const d=values[i]-values[i-1]; if (d>0) gains+=d; else losses-=d; }
+  let avgGain=gains/period, avgLoss=losses/period;
+  const calc=()=>avgLoss===0 ? 100 : 100-(100/(1+avgGain/avgLoss));
+  out[period]=calc();
+  for (let i=period+1;i<values.length;i++) {
+    const d=values[i]-values[i-1], gain=Math.max(d,0), loss=Math.max(-d,0);
+    avgGain=(avgGain*(period-1)+gain)/period; avgLoss=(avgLoss*(period-1)+loss)/period; out[i]=calc();
+  }
+  return out;
+}
+function atrSeries(rows: Obj[], period = 14): Array<number | null> {
+  const tr: number[] = rows.map((r,i)=> i===0 ? r.high-r.low : Math.max(r.high-r.low, Math.abs(r.high-rows[i-1].close), Math.abs(r.low-rows[i-1].close)));
+  const out: Array<number | null> = Array(rows.length).fill(null);
+  if (tr.length < period) return out;
+  let prev=tr.slice(0,period).reduce((a,b)=>a+b,0)/period; out[period-1]=prev;
+  for (let i=period;i<tr.length;i++) { prev=(prev*(period-1)+tr[i])/period; out[i]=prev; }
+  return out;
+}
+function signalFromClosed(rows: Obj[]) {
+  if (rows.length < 30) return {ready:false, reason:'INSUFFICIENT_CLOSED_CANDLES', required:30, received:rows.length};
+  const closes=rows.map(r=>Number(r.close));
+  const ema9=emaSeries(closes,9), ema21=emaSeries(closes,21), rsi14=rsiSeries(closes,14), atr14=atrSeries(rows,14);
+  const i=rows.length-1, last=rows[i];
+  const e9=ema9[i], e21=ema21[i], rsi=rsi14[i], atr=atr14[i];
+  if (e9===null || e21===null || rsi===null || atr===null || atr<=0) return {ready:false, reason:'INDICATORS_NOT_READY'};
+  const trendRaw=(e9-e21)/atr;
+  const trend=clamp(trendRaw*35,-100,100);
+  const rsiComponent=clamp((rsi-50)*2,-100,100);
+  const lookback=5;
+  const momentumRaw=(last.close-rows[i-lookback].close)/atr;
+  const momentum=clamp(momentumRaw*35,-100,100);
+  const structureRaw=(last.close-e21)/atr;
+  const structure=clamp(structureRaw*30,-100,100);
+  // Balanced first research model. It is a signal score, not a profitability claim.
+  const score=Math.round(clamp(trend*0.40 + momentum*0.25 + rsiComponent*0.20 + structure*0.15,-100,100));
+  const direction=score>=60?'LONG':score<=-60?'SHORT':'NEUTRAL';
+  const strength=Math.abs(score)>=80?'STRONG':Math.abs(score)>=60?'ACTIVE':Math.abs(score)>=35?'WATCH':'WEAK';
+  return {ready:true, candle_time:last.time, close:last.close,
+    indicators:{ema9:round(e9),ema21:round(e21),rsi14:round(rsi,2),atr14:round(atr)},
+    components:{trend:round(trend,2),momentum_5:round(momentum,2),rsi:round(rsiComponent,2),structure:round(structure,2)},
+    signal_score:score,direction,strength,
+    thresholds:{long:60,short:-60},
+    model:'EMA9/21 40% + MOMENTUM5 25% + RSI14 20% + EMA21 STRUCTURE 15%'};
+}
+async function signal(env: Env, epic: string, resolution: string) {
+  const history=await candles(env,epic,resolution);
+  const closed=(history.candles as Obj[]).filter(x=>x.complete===true);
+  const result=signalFromClosed(closed);
+  return {success:result.ready===true,...INFO,module:'SIGNAL_ENGINE',epic,resolution,price_basis:'BID',
+    fetched_at:history.fetched_at,closed_count:closed.length,history_stale:history.history_stale,
+    signal:result,trading:'DISABLED',execution:'NONE',
+    note:'Research signal calculated only from CLOSED broker candles. No order is created or sent.'};
 }
 
 const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Market Pulse</title>
@@ -319,7 +395,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -328,6 +404,7 @@ export default {
       if (missing.length) return json({success: false, ...INFO, error: 'MISSING_SECRETS', missing}, 503);
       if (url.pathname === '/api/dashboard') return json(await dashboard(env));
       if (url.pathname === '/api/candles') return json(await candles(env, url.searchParams.get('epic') ?? '', url.searchParams.get('resolution') ?? 'MINUTE'));
+      if (url.pathname === '/api/signal') return json(await signal(env, url.searchParams.get('epic') ?? 'EURUSD', url.searchParams.get('resolution') ?? 'MINUTE_5'));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
