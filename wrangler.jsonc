@@ -3,5 +3,19 @@
   "name": "market-pulse",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-22",
-  "workers_dev": true
+  "workers_dev": true,
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "market-pulse-db",
+      "database_id": "0f6af924-deb8-4bff-bbfd-e66b0fc36e8b"
+    }
+  ],
+
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
 }
