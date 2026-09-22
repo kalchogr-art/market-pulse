@@ -1,4 +1,4 @@
-// Market Pulse V1.4.1 — Capital.com DEMO + News/Macro + D1 1m/5m/30m snapshots. READ ONLY. No trading endpoints.
+// Market Pulse V1.4.2 — Capital.com DEMO + News/Macro + D1 dashboard controls. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.4.1';
+const VERSION = '1.4.2';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -511,7 +511,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.4.1 · Capital.com · D1 Snapshot History · 1m / 5m / 30m</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.4.2 · Capital.com · D1 Dashboard Controls · 1m / 5m / 30m</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -522,7 +522,47 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <section class="panel"><h2>Signal Engine</h2><div class="bar"><button id="signal">Анализирай избрания пазар</button><small>Използва само затворени BID свещи. Няма изпълнение на сделки.</small></div><p class="muted" id="signalInfo">Няма изчислен сигнал.</p><div class="grid"><div class="card"><h3>Посока</h3><div class="price" id="signalDirection">—</div><small id="signalStrength">—</small></div><div class="card"><h3>Signal Score</h3><div class="price" id="signalScore">—</div><small>LONG ≥ +60 · SHORT ≤ −60</small></div><div class="card"><h3>EMA 9 / 21</h3><div class="price" id="signalEma">—</div><small>Trend component: <span id="signalTrend">—</span></small></div><div class="card"><h3>RSI 14</h3><div class="price" id="signalRsi">—</div><small>RSI component: <span id="signalRsiComponent">—</span></small></div><div class="card"><h3>ATR 14</h3><div class="price" id="signalAtr">—</div><small>Volatility scale</small></div><div class="card"><h3>Momentum / Structure</h3><div class="price" id="signalMomentum">—</div><small>Structure: <span id="signalStructure">—</span></small></div></div></section>
 <section class="panel"><h2>News / Macro Engine</h2><div class="bar"><button id="news">Зареди новини за избрания пазар</button><small>Официални RSS източници · Fed · ECB · CFTC · READ ONLY</small></div><p class="muted" id="newsInfo">Няма зареден news/macro контекст.</p><div class="grid"><div class="card"><h3>News Bias</h3><div class="price" id="newsBias">—</div><small>Signed score: <span id="newsScore">—</span></small></div><div class="card"><h3>Източници</h3><div class="price" id="newsSources">—</div><small>работещи / конфигурирани</small></div><div class="card"><h3>Активни новини</h3><div class="price" id="newsActive">—</div><small>релевантни за избрания актив</small></div></div><div class="scroll"><table><thead><tr><th>Източник</th><th>Новина</th><th>Възраст</th><th>Relevance</th><th>Impact</th><th>Посока</th><th>Score</th></tr></thead><tbody id="newsRows"></tbody></table></div></section>
 <details class="panel"><summary>Диагностика / JSON на последния отговор</summary><pre id="result">Няма данни.</pre></details>
+
+<section class="card" id="d1-controls">
+  <h2>💾 D1 SNAPSHOT HISTORY</h2>
+  <p class="muted">Research-only snapshots: EURUSD, GOLD, SILVER, Crude Oil and Brent · 1m / 5m / 30m.</p>
+  <div class="actions">
+    <button id="run-snapshot-btn" type="button">💾 RUN SNAPSHOT</button>
+    <button id="snapshot-status-btn" type="button">📚 SNAPSHOT STATUS</button>
+  </div>
+  <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
+</section>
 <script>
+
+const mpGetAdminToken = () => {
+  const ids = ['admin-token','adminToken','token','auth-token'];
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el && typeof el.value === 'string' && el.value.trim()) return el.value.trim();
+  }
+  return (localStorage.getItem('market_pulse_admin_token') ||
+          localStorage.getItem('admin_token') ||
+          localStorage.getItem('ADMIN_TOKEN') || '').trim();
+};
+async function mpD1Call(path) {
+  const out = document.getElementById('snapshot-output');
+  const token = mpGetAdminToken();
+  if (!token) {
+    out.textContent = 'ADMIN_TOKEN липсва. Въведи token-а в полето на dashboard-а и опитай пак.';
+    return;
+  }
+  out.textContent = 'Зареждане...';
+  try {
+    const r = await fetch(path, {headers:{'Authorization':'Bearer '+token,'Accept':'application/json'}});
+    const body = await r.json().catch(()=>({success:false,error:'INVALID_JSON_RESPONSE',http_status:r.status}));
+    out.textContent = JSON.stringify(body,null,2);
+  } catch (e) {
+    out.textContent = JSON.stringify({success:false,error:'DASHBOARD_REQUEST_FAILED'},null,2);
+  }
+}
+document.getElementById('run-snapshot-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-run'));
+document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-status'));
+
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
 function element(tag,text,cls){const e=document.createElement(tag);e.textContent=text;if(cls)e.className=cls;return e;}
