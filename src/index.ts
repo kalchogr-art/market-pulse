@@ -1,4 +1,4 @@
-// Market Pulse V1.2.0 — Capital.com DEMO signal engine. READ ONLY. No trading endpoints.
+// Market Pulse V1.4.1 — Capital.com DEMO + News/Macro + D1 1m/5m/30m snapshots. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -411,10 +411,32 @@ function compactSignal(x: Obj) {
   return {ready:x?.ready===true, candle_time:x?.candle_time??null, close:number(x?.close), signal_score:number(x?.signal_score), direction:x?.direction??'NOT_READY', strength:x?.strength??null, indicators:x?.indicators??null, components:x?.components??null};
 }
 function combinedSnapshotScore(s1: Obj, s5: Obj, s30: Obj, news: Obj) {
-  const a=number(s1?.signal_score)??0, b=number(s5?.signal_score)??0, c=number(s30?.signal_score)??0, n=number(news?.signed_score)??0;
+  const readiness = {
+    signal_1m: s1?.ready === true && number(s1?.signal_score) !== null,
+    signal_5m: s5?.ready === true && number(s5?.signal_score) !== null,
+    signal_30m: s30?.ready === true && number(s30?.signal_score) !== null
+  };
+  if (!readiness.signal_1m || !readiness.signal_5m || !readiness.signal_30m) {
+    return {
+      ready: false,
+      score: null,
+      direction: 'NOT_READY',
+      readiness,
+      weights: {signal_1m:0.20,signal_5m:0.40,signal_30m:0.30,news:0.10},
+      reason: 'ONE_OR_MORE_TIMEFRAMES_NOT_READY'
+    };
+  }
+  const a=number(s1.signal_score)!, b=number(s5.signal_score)!, c=number(s30.signal_score)!;
+  const n=number(news?.signed_score)??0;
   // 5m is the main timeframe; 30m context; 1m timing; news remains context-only at 10%.
   const score=Math.max(-100,Math.min(100,a*0.20+b*0.40+c*0.30+n*0.10));
-  return {score:Math.round(score*100)/100,direction:score>=60?'LONG':score<=-60?'SHORT':'NEUTRAL',weights:{signal_1m:0.20,signal_5m:0.40,signal_30m:0.30,news:0.10}};
+  return {
+    ready:true,
+    score:Math.round(score*100)/100,
+    direction:score>=60?'LONG':score<=-60?'SHORT':'NEUTRAL',
+    readiness,
+    weights:{signal_1m:0.20,signal_5m:0.40,signal_30m:0.30,news:0.10}
+  };
 }
 async function buildSnapshot(env: Env, epic: string, sharedNewsItems?: NewsItem[]) {
   const histories: Obj[]=[];
@@ -465,13 +487,31 @@ async function snapshotHistory(env: Env, epic: string, limitRaw: string|null) {
   const r=await env.DB.prepare(`SELECT captured_at,epic,price,signal_1m,direction_1m,signal_5m,direction_5m,signal_30m,direction_30m,news_score,news_bias,combined_score,combined_direction FROM market_snapshots WHERE epic=? ORDER BY captured_at DESC LIMIT ?`).bind(epic,limit).all();
   return {success:true,...INFO,module:'D1_SNAPSHOT_HISTORY',epic,count:r.results?.length??0,rows:r.results??[],trading:'DISABLED'};
 }
-async function snapshotStatus(env: Env){await ensureSnapshotSchema(env);const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();const byEpic=await env.DB.prepare('SELECT epic, COUNT(*) AS count, MAX(captured_at) AS last_snapshot FROM market_snapshots GROUP BY epic ORDER BY epic').all();return{success:true,...INFO,module:'D1_SNAPSHOT_STATUS',total:total??{},by_epic:byEpic.results??[],timeframes:['1m','5m','30m'],trading:'DISABLED'};}
+async function snapshotStatus(env: Env){
+  await ensureSnapshotSchema(env);
+  const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();
+  const byEpic=await env.DB.prepare('SELECT epic, COUNT(*) AS count, MAX(captured_at) AS last_snapshot FROM market_snapshots GROUP BY epic ORDER BY epic').all();
+  const rows=(byEpic.results??[]) as Obj[];
+  const expected=WATCHLIST.map(x=>x.epic);
+  const present=new Set(rows.map(x=>String(x.epic)));
+  return {
+    success:true,...INFO,module:'D1_SNAPSHOT_STATUS',
+    total:total??{},
+    expected_epics:expected.length,
+    epics_with_snapshots:present.size,
+    missing_epics:expected.filter(x=>!present.has(x)),
+    all_watchlist_epics_present:expected.every(x=>present.has(x)),
+    by_epic:rows,
+    timeframes:['1m','5m','30m'],
+    trading:'DISABLED'
+  };
+}
 
 const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Market Pulse</title>
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.3.1 · Capital.com · News Classifier Fix</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.4.1 · Capital.com · D1 Snapshot History · 1m / 5m / 30m</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -550,7 +590,29 @@ export default {
       return json({...INFO, ...failure(error)}, error instanceof Fault ? error.status : 500);
     }
   },
-  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    ctx.waitUntil(snapshotRun(env).then(()=>undefined).catch(()=>undefined));
+  async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil((async()=>{
+      try {
+        const result=await snapshotRun(env);
+        console.log(JSON.stringify({
+          event:'MARKET_PULSE_CRON',
+          version:VERSION,
+          scheduled_time:event.scheduledTime,
+          success:result.success,
+          inserted:result.inserted,
+          duplicates:result.duplicates,
+          failed:result.failed
+        }));
+      } catch (error) {
+        const detail=failure(error);
+        console.error(JSON.stringify({
+          event:'MARKET_PULSE_CRON_ERROR',
+          version:VERSION,
+          scheduled_time:event.scheduledTime,
+          ...detail
+        }));
+        throw error;
+      }
+    })());
   }
 };
