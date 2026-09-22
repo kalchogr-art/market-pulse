@@ -1,4 +1,4 @@
-// Market Pulse V1.6.3 — Capital.com DEMO Order Test Session Fix + Paper Analytics. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.0 — CONFIG + DEMO Full Cycle + Paper Analytics. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,9 +8,30 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.6.3';
+const VERSION = '1.7.0';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
+
+const CONFIG = {
+  TRADING_ENABLED: false,
+  ACCOUNT_CURRENCY: 'EUR',
+  CAPITAL_PER_TRADE_EUR: 1,
+  LEVERAGE: 10,
+  STOP_LOSS_PCT: 0.25,
+
+  SIGNAL_ENGINE_ENABLED: true,
+  NEWS_ENABLED: true,
+  SNAPSHOTS_ENABLED: true,
+  PERSISTENCE_ENABLED: true,
+  PAPER_ENGINE_ENABLED: true,
+  AUTO_EXECUTION_ENABLED: true,
+
+  ENTRY_SCORE: 60,
+  PERSISTENCE_SCORE: 35,
+  MIN_REGIME_STREAK: 3,
+  MIN_ABS_ACCELERATION: 3
+} as const;
+
 class Fault extends Error {
   code: string; status: number; upstreamStatus?: number; diagnostic?: Obj;
   constructor(code: string, status = 502, upstreamStatus?: number, diagnostic?: Obj) {
@@ -276,6 +297,101 @@ async function demoOrderTest(env:Env){
     close_sent:false,
     next_step:'Inspect confirmation and open position. Closing remains a separate manual test.',
     trading:'DEMO_TEST'
+  };
+}
+
+
+async function demoOpenPositions(env:Env){
+  const data=await get(env,'/positions');
+  return Array.isArray(data.positions)?data.positions:[];
+}
+
+async function closeDemoPosition(env:Env, requestedDealId?:string){
+  if(!BASE.includes('demo-api-capital.backend-capital.com'))throw new Fault('DEMO_BASE_URL_REQUIRED',409);
+  const positions=await demoOpenPositions(env);
+  const candidates=positions.filter((x:Obj)=>String(x?.market?.epic??'')==='GOLD' && Number(x?.position?.size)>0);
+  const target=requestedDealId
+    ? positions.find((x:Obj)=>String(x?.position?.dealId??'')===requestedDealId)
+    : candidates[0];
+  if(!target)throw new Fault('NO_OPEN_DEMO_GOLD_POSITION',404,undefined,{open_positions:positions.length,gold_positions:candidates.length});
+  const dealId=String(target.position?.dealId??'');
+  if(!dealId)throw new Fault('OPEN_POSITION_DEAL_ID_MISSING',502);
+
+  const closed=await capitalTradeRequest(env,'/positions/'+encodeURIComponent(dealId),'DELETE');
+  const dealReference=typeof closed.dealReference==='string'?closed.dealReference:null;
+  if(!dealReference)throw new Fault('DEMO_CLOSE_NO_DEAL_REFERENCE',502,undefined,{deal_id:dealId,response_keys:Object.keys(closed)});
+
+  let confirmation:Obj|null=null;
+  let confirmError:string|null=null;
+  for(let i=0;i<5;i++){
+    if(i)await new Promise(r=>setTimeout(r,500));
+    try{confirmation=await get(env,'/confirms/'+encodeURIComponent(dealReference));confirmError=null;break;}
+    catch(e){confirmError=e instanceof Fault?e.code:'CONFIRM_FAILED';}
+  }
+  const after=await demoOpenPositions(env);
+  const stillOpen=after.some((x:Obj)=>String(x?.position?.dealId??'')===dealId);
+
+  return {
+    success:true,...INFO,module:'DEMO_CLOSE_TEST',demo_only:true,manual_only:true,
+    close_sent:true,target:{epic:target.market?.epic??null,deal_id:dealId,direction:target.position?.direction??null,size:number(target.position?.size)},
+    close_response:{deal_reference:dealReference},
+    confirmation:confirmation?{
+      deal_status:confirmation.dealStatus??null,status:confirmation.status??null,reason:confirmation.reason??null,
+      deal_id:confirmation.dealId??null,level:number(confirmation.level),
+      affected_deals:Array.isArray(confirmation.affectedDeals)?confirmation.affectedDeals.map((x:Obj)=>({deal_id:x?.dealId??null,status:x?.status??null})):[]
+    }:{available:false,error:confirmError},
+    position_closed_verified:!stillOpen,
+    open_positions_after:after.length,
+    trading:'DEMO_TEST'
+  };
+}
+
+async function demoFullCycle(env:Env){
+  // Manual diagnostic: OPEN one minimum GOLD demo position, verify it, then CLOSE the exact opened position.
+  const opened=await demoOrderTest(env);
+  if(!opened.success || !opened.order_response?.deal_reference)
+    throw new Fault('FULL_CYCLE_OPEN_FAILED',502,undefined,{open_result:opened});
+
+  let positions:Obj[]=[];
+  let target:Obj|null=null;
+  for(let i=0;i<6;i++){
+    if(i)await new Promise(r=>setTimeout(r,500));
+    positions=await demoOpenPositions(env);
+    target=positions.find((x:Obj)=>
+      String(x?.market?.epic??'')==='GOLD' &&
+      (String(x?.position?.dealReference??'')===String(opened.order_response.deal_reference) ||
+       Number(x?.position?.size)===0.01)
+    )??null;
+    if(target)break;
+  }
+  if(!target)throw new Fault('FULL_CYCLE_OPEN_POSITION_NOT_FOUND',502,undefined,{
+    deal_reference:opened.order_response.deal_reference,open_positions:positions.length
+  });
+  const realDealId=String(target.position?.dealId??'');
+  const closed=await closeDemoPosition(env,realDealId);
+  return {
+    success:true,...INFO,module:'DEMO_FULL_CYCLE',
+    config:{
+      trading_enabled:CONFIG.TRADING_ENABLED,account_currency:CONFIG.ACCOUNT_CURRENCY,
+      capital_per_trade_eur:CONFIG.CAPITAL_PER_TRADE_EUR,leverage:CONFIG.LEVERAGE,
+      stop_loss_pct:CONFIG.STOP_LOSS_PCT
+    },
+    open:{
+      accepted:opened.confirmation?.deal_status==='ACCEPTED',
+      deal_reference:opened.order_response?.deal_reference??null,
+      real_deal_id:realDealId,
+      direction:target.position?.direction??null,size:number(target.position?.size),
+      level:number(target.position?.level)
+    },
+    close:{
+      sent:closed.close_sent===true,
+      accepted:closed.confirmation?.deal_status==='ACCEPTED',
+      deal_reference:closed.close_response?.deal_reference??null,
+      position_closed_verified:closed.position_closed_verified===true
+    },
+    full_cycle_verified:opened.confirmation?.deal_status==='ACCEPTED' && closed.position_closed_verified===true,
+    paper_engine_unchanged:true,cron_can_execute_trades:false,
+    trading:'DEMO_FULL_CYCLE_TEST'
   };
 }
 
@@ -963,7 +1079,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.6.3 · Capital.com · DEMO ORDER TEST · SESSION FIX</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.0 · CONFIG · DEMO FULL CYCLE · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -986,6 +1102,8 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="demo-trading-diag-btn" type="button">🔌 DEMO TRADING DIAG</button>
     <button id="demo-order-test-btn" type="button">🧪 DEMO BUY GOLD 0.01</button>
+    <button id="demo-close-test-btn" type="button">🔴 CLOSE DEMO GOLD</button>
+    <button id="demo-full-cycle-btn" type="button">🔄 DEMO FULL CYCLE</button>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -1027,6 +1145,14 @@ document.getElementById('demo-order-test-btn')?.addEventListener('click',async()
   if(!confirm('DEMO ONLY: open a GOLD BUY position at the current minimum size 0.01? It will remain OPEN until we test closing separately.'))return;
   await mpD1Call('/api/demo-order-test');
 });
+document.getElementById('demo-close-test-btn')?.addEventListener('click',async()=>{
+  if(!confirm('DEMO ONLY: close the first open GOLD demo position?'))return;
+  await mpD1Call('/api/demo-close-test');
+});
+document.getElementById('demo-full-cycle-btn')?.addEventListener('click',async()=>{
+  if(!confirm('DEMO ONLY: open GOLD 0.01, verify it, then close the same position automatically?'))return;
+  await mpD1Call('/api/demo-full-cycle');
+});
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1062,7 +1188,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic', '/api/demo-order-test'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1084,6 +1210,8 @@ export default {
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
+      if (url.pathname === '/api/demo-close-test') return json(await closeDemoPosition(env));
+      if (url.pathname === '/api/demo-full-cycle') return json(await demoFullCycle(env));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
