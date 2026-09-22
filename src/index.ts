@@ -1,4 +1,4 @@
-// Market Pulse V1.5.2 — Capital.com DEMO + D1 Paper Analytics Foundation. READ ONLY. No trading endpoints.
+// Market Pulse V1.6.0 — Capital.com DEMO Trading Diagnostic + Paper Analytics. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.5.2';
+const VERSION = '1.6.0';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -173,6 +173,73 @@ function utcMs(value: unknown): number | null {
 }
 // Use the search route already verified against this demo account.
 // Four read requests, at most two concurrently; Oil supplies both exact oil epics.
+
+async function demoTradingDiagnostic(env: Env) {
+  // READ ONLY: GET requests only. Never POST /positions or PUT account settings here.
+  const accountsData=await get(env,'/accounts');
+  const prefs=await get(env,'/accounts/preferences');
+  const sess=await get(env,'/session');
+  if(!Array.isArray(accountsData.accounts))throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
+  const preferred=accountsData.accounts.find((a:Obj)=>a?.preferred===true)??accountsData.accounts[0]??null;
+  const markets:Obj[]=[];
+  for(const item of WATCHLIST){
+    try{
+      const m=await get(env,'/markets/'+encodeURIComponent(item.epic));
+      const i=m.instrument??{}, d=m.dealingRules??{}, q=m.snapshot??{};
+      markets.push({
+        epic:item.epic,label:item.label,success:true,
+        instrument:{
+          name:i.name??null,type:i.type??null,currency:i.currency??null,lot_size:number(i.lotSize),
+          margin_factor:number(i.marginFactor),margin_factor_unit:i.marginFactorUnit??null,
+          guaranteed_stop_allowed:i.guaranteedStopAllowed===true,streaming_prices_available:i.streamingPricesAvailable===true
+        },
+        dealing_rules:{
+          min_deal_size:d.minDealSize??null,max_deal_size:d.maxDealSize??null,min_size_increment:d.minSizeIncrement??null,
+          min_stop_or_profit_distance:d.minStopOrProfitDistance??null,max_stop_or_profit_distance:d.maxStopOrProfitDistance??null,
+          market_order_preference:d.marketOrderPreference??null,trailing_stops_preference:d.trailingStopsPreference??null
+        },
+        market:{
+          status:q.marketStatus??null,bid:number(q.bid),offer:number(q.offer),
+          spread:number(q.bid)!==null&&number(q.offer)!==null?Number((Number(q.offer)-Number(q.bid)).toPrecision(10)):null,
+          market_modes:Array.isArray(q.marketModes)?q.marketModes:[]
+        }
+      });
+    }catch(error){
+      markets.push({epic:item.epic,label:item.label,success:false,...failure(error)});
+    }
+  }
+  return{
+    success:true,...INFO,module:'DEMO_TRADING_DIAGNOSTIC',safe_read_only:true,
+    order_endpoints_called:false,account_settings_modified:false,
+    session:{
+      account_id:sess.accountId??null,client_id:sess.clientId??null,
+      timezone_offset:sess.timezoneOffset??null,locale:sess.locale??null,
+      currency:sess.currency??preferred?.currency??null
+    },
+    active_account:preferred?{
+      account_id:preferred.accountId??null,account_name:preferred.accountName??null,
+      status:preferred.status??null,type:preferred.accountType??null,preferred:preferred.preferred===true,
+      currency:preferred.currency??null,balance:number(preferred.balance?.balance),
+      available:number(preferred.balance?.available),profit_loss:number(preferred.balance?.profitLoss)
+    }:null,
+    account_preferences:{
+      hedging_mode:prefs.hedgingMode===true,
+      leverages:prefs.leverages??null
+    },
+    readiness:{
+      demo_base_url:BASE.includes('demo-api-capital.backend-capital.com'),
+      account_enabled:preferred?.status==='ENABLED',
+      session_account_matches_preferred:preferred?String(sess.accountId??'')===String(preferred.accountId??''):null,
+      watchlist_markets_returned:markets.filter(x=>x.success===true).length,
+      watchlist_tradeable_now:markets.filter(x=>x.success===true&&x.market?.status==='TRADEABLE').length,
+      note:'Diagnostic only. No position is opened and no account preference is changed.'
+    },
+    markets,
+    next_step:'Review min deal sizes, increments, account mode and market status before implementing any one-shot DEMO order test.',
+    trading:'DISABLED',execution:'NONE'
+  };
+}
+
 async function dashboard(env: Env) {
   const searches = [
     {query: 'EURUSD', epics: ['EURUSD']},
@@ -791,7 +858,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.5.2 · Capital.com · PAPER ANALYTICS · No Orders</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.6.0 · Capital.com · DEMO TRADING DIAGNOSTIC · READ ONLY</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -812,6 +879,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="persistence-btn" type="button">📈 PERSISTENCE</button>
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
+    <button id="demo-trading-diag-btn" type="button">🔌 DEMO TRADING DIAG</button>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -848,6 +916,7 @@ document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD
 document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Call('/api/persistence'));
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
+document.getElementById('demo-trading-diag-btn')?.addEventListener('click',()=>mpD1Call('/api/demo-trading-diagnostic'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -883,7 +952,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -903,6 +972,7 @@ export default {
       }
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
+      if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
