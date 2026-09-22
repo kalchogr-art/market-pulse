@@ -1,4 +1,4 @@
-// Market Pulse V1.1.0 — Capital.com DEMO dashboard and historical candles. No trading endpoints.
+// Market Pulse V1.1.1 — Capital.com DEMO dashboard and historical candles. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -7,7 +7,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -170,12 +170,53 @@ function utcMs(value: unknown): number | null {
   const timestamp = Date.parse(/(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : value + 'Z');
   return Number.isFinite(timestamp) ? timestamp : null;
 }
+// Use the search route already verified against this demo account.
+// Four read requests, at most two concurrently; Oil supplies both exact oil epics.
 async function dashboard(env: Env) {
-  const data = await get(env, '/markets?epics=' + WATCHLIST.map(x => x.epic).join(','));
-  if (!Array.isArray(data.markets)) throw new Fault('CAPITAL_INVALID_MARKETS_RESPONSE');
+  const searches = [
+    {query: 'EURUSD', epics: ['EURUSD']},
+    {query: 'Gold', epics: ['GOLD']},
+    {query: 'silver', epics: ['SILVER']},
+    {query: 'Oil', epics: ['OIL_CRUDE', 'OIL_BRENT']}
+  ];
+  const results: Obj[] = [];
+  const errors = new Map<string, Obj>();
+  const checks: Obj[] = [];
+  // Authenticate once before starting concurrent GET requests.
+  await session(env);
+  for (let offset = 0; offset < searches.length; offset += 2) {
+    const batch = searches.slice(offset, offset + 2);
+    const settled = await Promise.allSettled(batch.map(async search => {
+      const data = await get(env, '/markets?searchTerm=' + encodeURIComponent(search.query));
+      if (!Array.isArray(data.markets)) {
+        throw new Fault('CAPITAL_INVALID_MARKETS_RESPONSE', 502, 200, {
+          endpoint: '/markets', method: 'GET', request_mode: 'searchTerm', query: search.query,
+          markets_field_type: data.markets === null ? 'null' : Array.isArray(data.markets) ? 'array' : typeof data.markets,
+          has_market_details_array: Array.isArray(data.marketDetails)
+        });
+      }
+      return data.markets;
+    }));
+    settled.forEach((outcome, i) => {
+      const search = batch[i];
+      if (outcome.status === 'fulfilled') {
+        // Discard unrelated search matches before building the watchlist.
+        const exact = outcome.value.filter((m: Obj) => m && search.epics.includes(m.epic));
+        results.push(...exact);
+        checks.push({query: search.query, success: true, returned_count: outcome.value.length,
+          exact_count: exact.length, expected_epics: search.epics});
+      } else {
+        const detail = failure(outcome.reason);
+        for (const epic of search.epics) errors.set(epic, detail);
+        checks.push({query: search.query, ...detail});
+      }
+    });
+  }
   const now = Date.now();
   const markets = WATCHLIST.map(item => {
-    const matches = data.markets.filter((m: Obj) => m && m.epic === item.epic);
+    const queryError = errors.get(item.epic);
+    if (queryError) return {...item, success: false, issue: queryError.error, diagnostic: queryError.diagnostic, upstream_status: queryError.upstream_status};
+    const matches = results.filter((m: Obj) => m && m.epic === item.epic);
     if (matches.length !== 1) return {...item, success: false, issue: matches.length ? 'DUPLICATE_EPIC' : 'MARKET_NOT_RETURNED'};
     const raw = matches[0];
     if (raw.instrumentType !== item.type) return {...item, success: false, issue: 'INSTRUMENT_TYPE_MISMATCH'};
@@ -189,7 +230,8 @@ async function dashboard(env: Env) {
       usable_quote: valid && freshness === 'FRESH' && q.status === 'TRADEABLE' && q.delay_time === 0,
       spread_pips: item.epic === 'EURUSD' && q.spread !== null ? Number((q.spread / 0.0001).toFixed(3)) : null};
   });
-  return {success: markets.every(m => m.success), ...INFO, fetched_at: new Date(now).toISOString(), markets,
+  return {success: markets.every(m => m.success), ...INFO, fetched_at: new Date(now).toISOString(),
+    source: 'SEARCH_TERM_EXACT_EPIC', request_count: searches.length, checks, markets,
     note: 'FRESH означава възраст до 60 секунди, не сигнал за вход. Времената updateTime без зона се тълкуват като UTC. Спредовете са в ценови единици.'};
 }
 function priceSide(value: unknown): {bid: number; ask: number} | null {
@@ -236,7 +278,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.1.0 · Capital.com</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.1.1 · Capital.com</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
