@@ -1,4 +1,4 @@
-// Market Pulse V1.5.1 — Capital.com DEMO + D1 Paper Matrix Engine. READ ONLY. No trading endpoints.
+// Market Pulse V1.5.2 — Capital.com DEMO + D1 Paper Analytics Foundation. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.5.1';
+const VERSION = '1.5.2';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -602,8 +602,19 @@ async function ensurePaperSchema(env: Env) {
     id TEXT PRIMARY KEY, epic TEXT NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL,
     entry_time TEXT NOT NULL, entry_price REAL NOT NULL, entry_combined_score REAL,
     entry_persistence_score REAL, entry_regime TEXT, entry_regime_streak INTEGER,
-    entry_acceleration REAL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+    entry_acceleration REAL, entry_atr_1m REAL, entry_atr_5m REAL, entry_atr_30m REAL,
+    entry_atr_pct_1m REAL, entry_atr_pct_5m REAL, entry_atr_pct_30m REAL,
+    volatility_regime TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
   )`).run();
+  const paperObsCols=(await env.DB.prepare(`PRAGMA table_info(paper_observations)`).all()).results??[];
+  const paperObsNames=new Set((paperObsCols as Obj[]).map((x:Obj)=>String(x.name)));
+  for(const [name,type] of [
+    ['entry_atr_1m','REAL'],['entry_atr_5m','REAL'],['entry_atr_30m','REAL'],
+    ['entry_atr_pct_1m','REAL'],['entry_atr_pct_5m','REAL'],['entry_atr_pct_30m','REAL'],
+    ['volatility_regime','TEXT']
+  ] as const){
+    if(!paperObsNames.has(name))await env.DB.prepare(`ALTER TABLE paper_observations ADD COLUMN ${name} ${type}`).run();
+  }
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_paper_obs_epic_status ON paper_observations(epic,status)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_matrix_trades (
     id TEXT PRIMARY KEY, observation_id TEXT NOT NULL, variant TEXT NOT NULL, epic TEXT NOT NULL,
@@ -635,14 +646,34 @@ function paperEntryDecision(snap:Obj,p:Obj){
     return{eligible:true,side:'SHORT',reason:'SHORT_CONFIRMED'};
   return{eligible:false,reason:'ENTRY_FILTER_NOT_MET'};
 }
+
+async function entryVolatility(env:Env,epic:string,price:number){
+  const frames=[['MINUTE','atr_1m','atr_pct_1m'],['MINUTE_5','atr_5m','atr_pct_5m'],['MINUTE_30','atr_30m','atr_pct_30m']] as const;
+  const out:Obj={atr_1m:null,atr_5m:null,atr_30m:null,atr_pct_1m:null,atr_pct_5m:null,atr_pct_30m:null};
+  for(const [resolution,ak,pk] of frames){
+    try{
+      const r=await signal(env,epic,resolution);
+      const atr=number(r.signal?.indicators?.atr14);
+      out[ak]=atr;
+      out[pk]=atr!==null&&price>0?round2(atr/price*100):null;
+    }catch{}
+  }
+  const basis=number(out.atr_pct_5m)??number(out.atr_pct_1m)??number(out.atr_pct_30m);
+  out.volatility_regime=basis===null?'UNKNOWN':basis<0.03?'LOW':basis<0.08?'NORMAL':basis<0.15?'HIGH':'EXTREME';
+  return out;
+}
 async function openMatrixObservation(env:Env, epic:string, side:string, snap:Obj, p:Obj){
   const now=String(snap.captured_at??new Date().toISOString()), price=number(snap.price);
   if(price===null)return null;
   const oid=`${epic}|${now}|${side}`;
+  const vol=await entryVolatility(env,epic,price);
   await env.DB.prepare(`INSERT OR IGNORE INTO paper_observations
-    (id,epic,side,status,entry_time,entry_price,entry_combined_score,entry_persistence_score,entry_regime,entry_regime_streak,entry_acceleration,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(oid,epic,side,'OPEN',now,price,number(snap.combined_score),number(p.persistence?.score),
-      String(p.persistence?.bias??'NOT_READY'),Number(p.regime_streak?.count??0),number(p.persistence?.acceleration),now,now).run();
+    (id,epic,side,status,entry_time,entry_price,entry_combined_score,entry_persistence_score,entry_regime,entry_regime_streak,entry_acceleration,
+     entry_atr_1m,entry_atr_5m,entry_atr_30m,entry_atr_pct_1m,entry_atr_pct_5m,entry_atr_pct_30m,volatility_regime,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      oid,epic,side,'OPEN',now,price,number(snap.combined_score),number(p.persistence?.score),
+      String(p.persistence?.bias??'NOT_READY'),Number(p.regime_streak?.count??0),number(p.persistence?.acceleration),
+      vol.atr_1m,vol.atr_5m,vol.atr_30m,vol.atr_pct_1m,vol.atr_pct_5m,vol.atr_pct_30m,vol.volatility_regime,now,now).run();
   for(const v of PAPER_MATRIX){
     const id=`${oid}|${v.id}`;
     await env.DB.prepare(`INSERT OR IGNORE INTO paper_matrix_trades
@@ -697,24 +728,42 @@ async function paperRun(env:Env){
 }
 async function paperStatus(env:Env){
   await ensurePaperSchema(env);
-  const obs=await env.DB.prepare(`SELECT COUNT(*) total,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed FROM paper_observations`).first<Obj>();
+  const obs=await env.DB.prepare(`SELECT COUNT(*) total,
+    COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) open,
+    COALESCE(SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),0) closed
+    FROM paper_observations`).first<Obj>();
   const matrix=await env.DB.prepare(`SELECT variant,COUNT(*) trades,
     SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
     SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
     SUM(CASE WHEN status='CLOSED' AND pnl_pct<=0 THEN 1 ELSE 0 END) losses,
     ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value,
-    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) avg_pnl_pct,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) expectancy_pct,
+    ROUND(CASE WHEN ABS(SUM(CASE WHEN status='CLOSED' AND pnl_value<0 THEN pnl_value ELSE 0 END))>0
+      THEN SUM(CASE WHEN status='CLOSED' AND pnl_value>0 THEN pnl_value ELSE 0 END)/
+           ABS(SUM(CASE WHEN status='CLOSED' AND pnl_value<0 THEN pnl_value ELSE 0 END)) END,4) profit_factor,
     ROUND(AVG(CASE WHEN status='CLOSED' THEN max_favorable_pct END),4) avg_mfe_pct,
     ROUND(AVG(CASE WHEN status='CLOSED' THEN max_adverse_pct END),4) avg_mae_pct
     FROM paper_matrix_trades GROUP BY variant ORDER BY variant`).all();
   const byAsset=await env.DB.prepare(`SELECT epic,variant,COUNT(*) trades,
     SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
     SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
-    ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value
+    ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) expectancy_pct
     FROM paper_matrix_trades GROUP BY epic,variant ORDER BY epic,variant`).all();
+  const byVol=await env.DB.prepare(`SELECT o.volatility_regime,t.variant,COUNT(*) trades,
+    SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN t.status='CLOSED' AND t.pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    ROUND(SUM(CASE WHEN t.status='CLOSED' THEN t.pnl_value ELSE 0 END),4) pnl_value,
+    ROUND(AVG(CASE WHEN t.status='CLOSED' THEN t.pnl_pct END),4) expectancy_pct,
+    ROUND(AVG(o.entry_atr_pct_5m),4) avg_entry_atr_pct_5m
+    FROM paper_matrix_trades t JOIN paper_observations o ON o.id=t.observation_id
+    GROUP BY o.volatility_regime,t.variant ORDER BY o.volatility_regime,t.variant`).all();
   const recent=await env.DB.prepare(`SELECT * FROM paper_observations ORDER BY entry_time DESC LIMIT 20`).all();
-  return{success:true,...INFO,module:'PAPER_MATRIX_STATUS',config:PAPER_CFG,matrix_definitions:PAPER_MATRIX,
-    observations:obs??{},variants:matrix.results??[],by_asset:byAsset.results??[],recent_observations:recent.results??[],
+  return{success:true,...INFO,module:'PAPER_ANALYTICS_FOUNDATION',config:PAPER_CFG,matrix_definitions:PAPER_MATRIX,
+    observations:obs??{},variants:matrix.results??[],by_asset:byAsset.results??[],by_volatility_regime:byVol.results??[],
+    recent_observations:recent.results??[],
+    analytics:{entry_atr_timeframes:['1m','5m','30m'],volatility_regimes:['LOW','NORMAL','HIGH','EXTREME','UNKNOWN'],
+      note:'ATR is recorded at entry for research segmentation. It does not change entries or TP/SL variants in V1.5.2.'},
     trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
 }
 
@@ -742,7 +791,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.5.1 · Capital.com · PAPER MATRIX ENGINE · No Orders</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.5.2 · Capital.com · PAPER ANALYTICS · No Orders</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
