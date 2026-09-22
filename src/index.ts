@@ -1,4 +1,4 @@
-// Market Pulse V1.7.1 — CONFIG + Signal History + Paper Analytics. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.2 — Signal Event Tracker + Visual History. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.1';
+const VERSION = '1.7.2';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -757,6 +757,85 @@ async function saveSnapshot(env: Env, snapshot: Obj, capturedAt: string) {
   ).run();
   return {snapshot_key:key,inserted:(r.meta?.changes??0)>0};
 }
+
+async function ensureSignalEventSchema(env:Env){
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS signal_events (
+    id TEXT PRIMARY KEY,
+    epic TEXT NOT NULL,
+    side TEXT NOT NULL,
+    status TEXT NOT NULL,
+    start_time TEXT NOT NULL,
+    last_above_time TEXT NOT NULL,
+    end_time TEXT,
+    entry_price REAL NOT NULL,
+    last_price REAL NOT NULL,
+    peak_score REAL NOT NULL,
+    entry_score REAL NOT NULL,
+    last_score REAL NOT NULL,
+    samples INTEGER NOT NULL DEFAULT 1,
+    max_favorable_pct REAL NOT NULL DEFAULT 0,
+    max_adverse_pct REAL NOT NULL DEFAULT 0,
+    qualified INTEGER NOT NULL DEFAULT 0,
+    qualification_reason TEXT,
+    persistence_score REAL,
+    regime_streak INTEGER,
+    acceleration REAL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signal_events_time ON signal_events(start_time DESC)`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signal_events_epic_status ON signal_events(epic,status)`).run();
+}
+function signalEventMove(side:string,entry:number,price:number){
+  if(!entry||!price)return 0;
+  const raw=(price-entry)/entry*100;
+  return side==='LONG'?raw:-raw;
+}
+async function trackSignalEvents(env:Env){
+  await ensureSignalEventSchema(env);
+  const now=new Date().toISOString();
+  const actions:Obj[]=[];
+  for(const item of WATCHLIST){
+    const snap=await latestSnapshotRow(env,item.epic);
+    if(!snap)continue;
+    const score=number(snap.combined_score),price=number(snap.price);
+    if(score===null||price===null)continue;
+    const side=score>=CONFIG.ENTRY_SCORE?'LONG':score<=-CONFIG.ENTRY_SCORE?'SHORT':null;
+    const open=await env.DB.prepare(`SELECT * FROM signal_events WHERE epic=? AND status='OPEN' ORDER BY start_time DESC LIMIT 1`).bind(item.epic).first<Obj>();
+
+    if(open){
+      const move=signalEventMove(String(open.side),Number(open.entry_price),price);
+      const mfe=Math.max(Number(open.max_favorable_pct??0),move);
+      const mae=Math.min(Number(open.max_adverse_pct??0),move);
+      if(side===String(open.side)){
+        const peak=String(open.side)==='LONG'?Math.max(Number(open.peak_score),score):Math.min(Number(open.peak_score),score);
+        await env.DB.prepare(`UPDATE signal_events SET last_above_time=?,last_price=?,last_score=?,peak_score=?,samples=samples+1,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
+          .bind(String(snap.captured_at),price,score,peak,mfe,mae,now,String(open.id)).run();
+        actions.push({epic:item.epic,action:'TRACK',id:open.id});
+        continue;
+      }
+      await env.DB.prepare(`UPDATE signal_events SET status='CLOSED',end_time=?,last_price=?,last_score=?,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
+        .bind(String(snap.captured_at),price,score,mfe,mae,now,String(open.id)).run();
+      actions.push({epic:item.epic,action:'CLOSE',id:open.id});
+    }
+    if(side){
+      const pstate=await persistenceForEpic(env,item.epic);
+      const decision=paperEntryDecision(snap,pstate);
+      const id='sig_'+item.epic+'_'+Date.parse(String(snap.captured_at));
+      const qualified=decision.eligible?1:0;
+      await env.DB.prepare(`INSERT OR IGNORE INTO signal_events
+        (id,epic,side,status,start_time,last_above_time,entry_price,last_price,peak_score,entry_score,last_score,samples,
+         max_favorable_pct,max_adverse_pct,qualified,qualification_reason,persistence_score,regime_streak,acceleration,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+        .bind(id,item.epic,side,'OPEN',String(snap.captured_at),String(snap.captured_at),price,price,score,score,score,1,
+          0,0,qualified,String(decision.reason??''),number(pstate.persistence?.score),Number(pstate.regime_streak?.count??0),
+          number(pstate.persistence?.acceleration),now,now).run();
+      actions.push({epic:item.epic,action:'OPEN',id,side,qualified:qualified===1,reason:decision.reason});
+    }
+  }
+  return actions;
+}
+
 async function snapshotRun(env: Env) {
   await ensureSnapshotSchema(env);
   const capturedAt=new Date().toISOString();
@@ -766,7 +845,8 @@ async function snapshotRun(env: Env) {
     try{const snap=await buildSnapshot(env,item.epic,shared.items);const saved=await saveSnapshot(env,snap,capturedAt);rows.push({success:true,...saved,...snap});}
     catch(error){rows.push({success:false,epic:item.epic,...failure(error)});}
   }
-  return {success:rows.some(x=>x.success),...INFO,module:'D1_SNAPSHOT_HISTORY',captured_at:capturedAt,timeframes:['1m','5m','30m'],source_health:{news_working:shared.results.filter(x=>x.ok).length,news_configured:shared.results.length},inserted:rows.filter(x=>x.inserted).length,duplicates:rows.filter(x=>x.success&&!x.inserted).length,failed:rows.filter(x=>!x.success).length,snapshots:rows,trading:'DISABLED',execution:'NONE',note:'Research snapshots only. One row per epic per UTC minute; duplicate CRON retries are ignored.'};
+  const signal_events=await trackSignalEvents(env);
+  return {success:rows.some(x=>x.success),...INFO,module:'D1_SNAPSHOT_HISTORY',signal_events,captured_at:capturedAt,timeframes:['1m','5m','30m'],source_health:{news_working:shared.results.filter(x=>x.ok).length,news_configured:shared.results.length},inserted:rows.filter(x=>x.inserted).length,duplicates:rows.filter(x=>x.success&&!x.inserted).length,failed:rows.filter(x=>!x.success).length,snapshots:rows,trading:'DISABLED',execution:'NONE',note:'Research snapshots only. One row per epic per UTC minute; duplicate CRON retries are ignored.'};
 }
 async function snapshotHistory(env: Env, epic: string, limitRaw: string|null) {
   await ensureSnapshotSchema(env);
@@ -1057,102 +1137,46 @@ async function paperStatus(env:Env){
 
 
 async function signalHistory(env:Env){
-  await ensureSnapshotSchema(env);
+  await ensureSignalEventSchema(env);
   await ensurePaperSchema(env);
-
-  // Every snapshot where the main combined score crossed the configured entry threshold.
-  const crossed=await env.DB.prepare(`
-    SELECT captured_at,epic,price,combined_score,combined_direction,
-           signal_1m,direction_1m,signal_5m,direction_5m,signal_30m,direction_30m,
-           news_score,news_bias
-    FROM market_snapshots
-    WHERE ABS(combined_score) >= ?
-    ORDER BY captured_at DESC
-    LIMIT 100
-  `).bind(CONFIG.ENTRY_SCORE).all();
-
-  const observations=await env.DB.prepare(`
-    SELECT o.*,
-      (SELECT ROUND(MAX(t.max_favorable_pct),4) FROM paper_matrix_trades t WHERE t.observation_id=o.id) AS mfe_pct,
-      (SELECT ROUND(MIN(t.max_adverse_pct),4) FROM paper_matrix_trades t WHERE t.observation_id=o.id) AS mae_pct
-    FROM paper_observations o
-    ORDER BY o.entry_time DESC
-    LIMIT 100
-  `).all();
-
-  const obsRows=(observations.results??[]) as Obj[];
-  const ids=obsRows.map(x=>String(x.id)).filter(Boolean);
-  let trades:Obj[]=[];
-  if(ids.length){
-    const placeholders=ids.map(()=>'?').join(',');
-    const r=await env.DB.prepare(`
-      SELECT observation_id,variant,status,tp_pct,sl_pct,max_hold_minutes,
-             entry_price,exit_price,exit_reason,pnl_pct,pnl_value,
-             max_favorable_pct,max_adverse_pct,entry_time,exit_time
-      FROM paper_matrix_trades
-      WHERE observation_id IN (${placeholders})
-      ORDER BY entry_time DESC,variant
-    `).bind(...ids).all();
-    trades=(r.results??[]) as Obj[];
-  }
-  const byObs=new Map<string,Obj[]>();
-  for(const t of trades){
-    const id=String(t.observation_id);
-    if(!byObs.has(id))byObs.set(id,[]);
-    byObs.get(id)!.push(t);
-  }
-
-  const qualified=obsRows.map(o=>{
-    const variants=byObs.get(String(o.id))??[];
-    const closed=variants.filter(v=>v.status==='CLOSED');
-    const avgPnl=closed.length?closed.reduce((a,v)=>a+(number(v.pnl_pct)??0),0)/closed.length:null;
-    const current=variants.find(v=>v.status==='OPEN');
+  const r=await env.DB.prepare(`SELECT * FROM signal_events ORDER BY start_time DESC LIMIT 100`).all();
+  const rows=(r.results??[]) as Obj[];
+  const events=rows.map(x=>{
+    const start=Date.parse(String(x.start_time)),end=Date.parse(String(x.end_time??x.last_above_time));
+    const duration=Math.max(1,Math.round((end-start)/60000)+1);
+    const entry=Number(x.entry_price),last=Number(x.last_price);
+    const pnl=signalEventMove(String(x.side),entry,last);
     return{
-      id:o.id,entry_time:o.entry_time,epic:o.epic,side:o.side,status:o.status,
-      entry_price:number(o.entry_price),
-      score:number(o.entry_combined_score),persistence:number(o.entry_persistence_score),
-      regime:o.entry_regime??null,regime_streak:Number(o.entry_regime_streak??0),
-      acceleration:number(o.entry_acceleration),volatility_regime:o.volatility_regime??null,
-      current_pnl_pct:current?round2(paperMovePct(String(o.side),Number(o.entry_price),Number((crossed.results??[]).find((x:Obj)=>x.epic===o.epic)?.price??o.entry_price))):null,
-      avg_closed_variant_pnl_pct:avgPnl===null?null:Math.round(avgPnl*10000)/10000,
-      mfe_pct:number(o.mfe_pct),mae_pct:number(o.mae_pct),
-      variants:variants.map(v=>({
-        id:v.variant,status:v.status,tp_pct:number(v.tp_pct),sl_pct:number(v.sl_pct),
-        max_hold_minutes:Number(v.max_hold_minutes),exit_reason:v.exit_reason??null,
-        pnl_pct:number(v.pnl_pct),pnl_value:number(v.pnl_value),
-        mfe_pct:number(v.max_favorable_pct),mae_pct:number(v.max_adverse_pct),
-        exit_time:v.exit_time??null
-      }))
+      time:x.start_time,asset:x.epic,side:x.side,status:x.status,
+      entry_price:entry,last_price:last,
+      entry_score:number(x.entry_score),peak_score:number(x.peak_score),
+      duration_min:duration,samples:Number(x.samples??1),
+      result_pct:Math.round(pnl*1000)/1000,
+      mfe_pct:Math.round(Number(x.max_favorable_pct??0)*1000)/1000,
+      mae_pct:Math.round(Number(x.max_adverse_pct??0)*1000)/1000,
+      filter:x.qualified?'QUALIFIED':'REJECTED',
+      reason:x.qualification_reason??null,
+      persistence:number(x.persistence_score),
+      streak:Number(x.regime_streak??0),
+      acceleration:number(x.acceleration)
     };
   });
-
-  const closedTrades=trades.filter(t=>t.status==='CLOSED');
-  const wins=closedTrades.filter(t=>(number(t.pnl_pct)??0)>0).length;
-  const losses=closedTrades.filter(t=>(number(t.pnl_pct)??0)<=0).length;
-  const totalPnlPct=closedTrades.reduce((a,t)=>a+(number(t.pnl_pct)??0),0);
-  const totalPnlValue=closedTrades.reduce((a,t)=>a+(number(t.pnl_value)??0),0);
-
-  return{
-    success:true,...INFO,module:'SIGNAL_HISTORY',
-    threshold:{entry_score:CONFIG.ENTRY_SCORE},
-    summary:{
-      threshold_crosses:(crossed.results??[]).length,
-      qualified_observations:qualified.length,
-      closed_variant_results:closedTrades.length,
-      wins,losses,
-      win_rate_pct:closedTrades.length?round2(wins/closedTrades.length*100):null,
-      total_pnl_pct:Math.round(totalPnlPct*10000)/10000,
-      total_pnl_value:Math.round(totalPnlValue*10000)/10000
-    },
-    qualified_signals:qualified,
-    threshold_crosses:(crossed.results??[]).map((x:Obj)=>({
-      time:x.captured_at,epic:x.epic,price:number(x.price),score:number(x.combined_score),
-      direction:x.combined_direction,signal_1m:number(x.signal_1m),signal_5m:number(x.signal_5m),
-      signal_30m:number(x.signal_30m),news_score:number(x.news_score),news_bias:x.news_bias
-    })),
-    note:'threshold_crosses contains every stored snapshot with |combined_score| >= entry threshold. qualified_signals contains signals that passed the full Paper entry filter and includes A-F P/L results.',
-    trading:CONFIG.TRADING_ENABLED?'ENABLED':'DISABLED',execution:'PAPER_ANALYTICS'
+  const closed=events.filter(x=>x.status==='CLOSED');
+  const wins=closed.filter(x=>x.result_pct>0).length,losses=closed.filter(x=>x.result_pct<=0).length;
+  const avg=closed.length?closed.reduce((a,x)=>a+x.result_pct,0)/closed.length:null;
+  const q=events.filter(x=>x.filter==='QUALIFIED'),rej=events.filter(x=>x.filter==='REJECTED');
+  const stats=(arr:typeof events)=>{
+    const c=arr.filter(x=>x.status==='CLOSED');
+    const w=c.filter(x=>x.result_pct>0).length;
+    return{signals:arr.length,closed:c.length,wins:w,losses:c.length-w,
+      win_rate_pct:c.length?round2(w/c.length*100):null,
+      avg_result_pct:c.length?Math.round(c.reduce((a,x)=>a+x.result_pct,0)/c.length*1000)/1000:null};
   };
+  return{success:true,...INFO,module:'SIGNAL_HISTORY',
+    summary:{signals:events.length,open:events.filter(x=>x.status==='OPEN').length,closed:closed.length,wins,losses,
+      win_rate_pct:closed.length?round2(wins/closed.length*100):null,avg_result_pct:avg===null?null:Math.round(avg*1000)/1000},
+    qualified:stats(q),rejected:stats(rej),signals:events,
+    threshold:CONFIG.ENTRY_SCORE,trading:CONFIG.TRADING_ENABLED?'ENABLED':'DISABLED'};
 }
 
 async function snapshotStatus(env: Env){
@@ -1177,9 +1201,9 @@ async function snapshotStatus(env: Env){
 
 const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Market Pulse</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
+:root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.1 · CONFIG · SIGNAL HISTORY · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.2 · SIGNAL EVENTS · VISUAL HISTORY · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1201,7 +1225,10 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
-    <button id="demo-close-test-btn" type="button">🔴 CLOSE DEMO GOLD</button>
+  </div>
+  <div id="signal-history-view" style="display:none">
+    <div class="sig-summary" id="signal-summary"></div>
+    <div id="signal-list"></div>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -1228,9 +1255,34 @@ async function mpD1Call(path) {
   try {
     const r = await fetch(path, {headers:{'Authorization':'Bearer '+token,'Accept':'application/json'}});
     const body = await r.json().catch(()=>({success:false,error:'INVALID_JSON_RESPONSE',http_status:r.status}));
-    out.textContent = JSON.stringify(body,null,2);
+    if(path==='/api/signal-history' && body.success){ renderSignalHistory(body); out.style.display='none'; }
+    else { document.getElementById('signal-history-view').style.display='none'; out.style.display='block'; out.textContent=JSON.stringify(body,null,2); }
   } catch (e) {
     out.textContent = JSON.stringify({success:false,error:'DASHBOARD_REQUEST_FAILED'},null,2);
+  }
+}
+
+function renderSignalHistory(data){
+  const view=document.getElementById('signal-history-view'),summary=document.getElementById('signal-summary'),list=document.getElementById('signal-list');
+  view.style.display='block';summary.replaceChildren();list.replaceChildren();
+  const stats=[
+    ['Signals',data.summary?.signals??0],['Open',data.summary?.open??0],['Closed',data.summary?.closed??0],
+    ['Wins',data.summary?.wins??0],['Losses',data.summary?.losses??0],
+    ['Win rate',data.summary?.win_rate_pct==null?'—':data.summary.win_rate_pct+'%'],
+    ['Avg result',data.summary?.avg_result_pct==null?'—':data.summary.avg_result_pct+'%']
+  ];
+  for(const [k,v] of stats){const d=document.createElement('div');d.className='sig-stat';d.innerHTML='<small>'+k+'</small><b>'+v+'</b>';summary.appendChild(d);}
+  for(const x of data.signals??[]){
+    const d=document.createElement('div');d.className='sig-card';
+    const pnl=Number(x.result_pct),pcls=pnl>0?'good':pnl<0?'bad':'muted';
+    const filter=x.filter==='QUALIFIED'?'<span class="good">QUALIFIED</span>':'<span class="warn">REJECTED</span>';
+    const dt=new Date(x.time).toLocaleString('bg-BG',{timeZone:'Europe/Sofia'});
+    d.innerHTML='<div class="sig-top"><b>'+x.asset+' · '+x.side+'</b><b class="'+pcls+'">'+(pnl>0?'+':'')+pnl.toFixed(3)+'%</b></div>'+
+      '<div class="sig-meta"><span>'+dt+'</span><span>'+x.status+'</span><span>'+filter+'</span><span>'+x.duration_min+' min</span></div>'+
+      '<div class="sig-meta"><span>Entry '+x.entry_price+'</span><span>Last '+x.last_price+'</span><span>Score '+x.entry_score+' → peak '+x.peak_score+'</span></div>'+
+      '<div class="sig-meta"><span>MFE '+x.mfe_pct+'%</span><span>MAE '+x.mae_pct+'%</span><span>Persistence '+(x.persistence??'—')+'</span><span>Streak '+x.streak+'</span><span>Accel '+(x.acceleration??'—')+'</span></div>'+
+      (x.filter==='REJECTED'?'<div class="sig-meta"><span>Reason: '+(x.reason??'—')+'</span></div>':'');
+    list.appendChild(d);
   }
 }
 document.getElementById('run-snapshot-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-run'));
@@ -1239,10 +1291,6 @@ document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Cal
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
-document.getElementById('demo-close-test-btn')?.addEventListener('click',async()=>{
-  if(!confirm('DEMO ONLY: close the first open GOLD demo position?'))return;
-  await mpD1Call('/api/demo-close-test');
-});
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
