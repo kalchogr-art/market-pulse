@@ -1,4 +1,4 @@
-// Market Pulse V1.6.0 — Capital.com DEMO Trading Diagnostic + Paper Analytics. READ ONLY. No trading endpoints.
+// Market Pulse V1.6.1 — Capital.com ONE-SHOT DEMO Order Test + Paper Analytics. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.6.0';
+const VERSION = '1.6.1';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -173,6 +173,146 @@ function utcMs(value: unknown): number | null {
 }
 // Use the search route already verified against this demo account.
 // Four read requests, at most two concurrently; Oil supplies both exact oil epics.
+
+
+async function capitalTradeRequest(env:Env,path:string,method:'POST'|'DELETE',body?:Obj){
+  const session=await auth(env);
+  const started=Date.now();
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),TIMEOUT_MS);
+  try{
+    const response=await fetch(BASE+path,{
+      method,
+      headers:{
+        'Accept':'application/json',
+        'Content-Type':'application/json',
+        'X-CAP-API-KEY':env.CAPITAL_API_KEY,
+        'CST':session.cst,
+        'X-SECURITY-TOKEN':session.token
+      },
+      ...(body?{body:JSON.stringify(body)}:{}),
+      signal:controller.signal
+    });
+    const ct=(response.headers.get('content-type')??'').toLowerCase();
+    const data=ct.includes('json')?await response.json().catch(()=>({})): {};
+    if(!response.ok)throw new Fault('CAPITAL_TRADE_HTTP_'+response.status,502,response.status,{
+      endpoint:path,method,http_status:response.status,elapsed_ms:Date.now()-started,
+      error_code:(data as Obj)?.errorCode??null
+    });
+    return data as Obj;
+  }catch(error){
+    if(error instanceof Fault)throw error;
+    throw new Fault('CAPITAL_TRADE_REQUEST_FAILED',502,undefined,{endpoint:path,method,elapsed_ms:Date.now()-started});
+  }finally{clearTimeout(timer);}
+}
+
+async function oneShotDemoOrderTest(env:Env){
+  // Intentionally isolated from CRON and Paper Engine. Manual endpoint only.
+  // This sends ONE minimum-size order to the DEMO base URL and does not close it automatically.
+  await ensureSchema(env);
+  if(!BASE.includes('demo-api-capital.backend-capital.com'))throw new Fault('DEMO_BASE_URL_REQUIRED',409);
+
+  const guard=await env.DB.prepare(`SELECT * FROM demo_order_test_guard WHERE id=1`).first<Obj>();
+  if(guard?.consumed===1){
+    return {success:false,...INFO,module:'ONE_SHOT_DEMO_ORDER_TEST',error:'ONE_SHOT_ALREADY_CONSUMED',
+      guard:{consumed:true,consumed_at:guard.consumed_at??null,epic:guard.epic??null,direction:guard.direction??null,
+        size:number(guard.size),deal_reference:guard.deal_reference??null,deal_id:guard.deal_id??null,
+        deal_status:guard.deal_status??null,confirm_status:guard.confirm_status??null,last_error:guard.last_error??null},
+      order_sent:false,trading:'DEMO_TEST_ONLY'};
+  }
+
+  const epic='GOLD', direction='BUY';
+  const market=await get(env,'/markets/'+encodeURIComponent(epic));
+  const rule=market.dealingRules?.minDealSize;
+  const minSize=number(rule?.value);
+  const status=market.snapshot?.marketStatus??null;
+  if(status!=='TRADEABLE')throw new Fault('DEMO_TEST_MARKET_NOT_TRADEABLE',409,undefined,{epic,market_status:status});
+  if(minSize===null||minSize<=0)throw new Fault('DEMO_TEST_MIN_SIZE_UNAVAILABLE',409,undefined,{epic,min_deal_size:rule??null});
+  // We deliberately require the observed GOLD minimum to remain 0.01. If Capital changes it, stop rather than risk a larger test.
+  if(minSize!==0.01)throw new Fault('DEMO_TEST_MIN_SIZE_CHANGED',409,undefined,{epic,expected:0.01,observed:minSize,unit:rule?.unit??null});
+
+  // Atomic claim BEFORE the network order. This makes repeated taps fail closed.
+  const claim=await env.DB.prepare(`
+    UPDATE demo_order_test_guard
+    SET consumed=1,consumed_at=?,epic=?,direction=?,size=?,last_error=NULL,updated_at=?
+    WHERE id=1 AND consumed=0
+  `).bind(new Date().toISOString(),epic,direction,minSize,new Date().toISOString()).run();
+  if((claim.meta?.changes??0)!==1)throw new Fault('ONE_SHOT_GUARD_NOT_ACQUIRED',409);
+
+  let dealReference:string|null=null;
+  try{
+    const placed=await capitalTradeRequest(env,'/positions','POST',{
+      epic,direction,size:minSize,guaranteedStop:false
+    });
+    dealReference=typeof placed.dealReference==='string'?placed.dealReference:null;
+    if(!dealReference)throw new Fault('DEMO_ORDER_NO_DEAL_REFERENCE',502,undefined,{epic,direction,size:minSize});
+
+    await env.DB.prepare(`UPDATE demo_order_test_guard SET deal_reference=?,updated_at=? WHERE id=1`)
+      .bind(dealReference,new Date().toISOString()).run();
+
+    // Confirmation can occasionally lag briefly after the POST.
+    let confirmation:Obj|null=null;
+    let confirmError:string|null=null;
+    for(let i=0;i<4;i++){
+      if(i)await new Promise(r=>setTimeout(r,500));
+      try{confirmation=await get(env,'/confirms/'+encodeURIComponent(dealReference));confirmError=null;break;}
+      catch(e){confirmError=e instanceof Fault?e.code:'CONFIRM_FAILED';}
+    }
+
+    const affected=Array.isArray(confirmation?.affectedDeals)?confirmation!.affectedDeals:[];
+    const opened=affected.find((x:Obj)=>x?.status==='OPENED')??affected[0]??null;
+    const dealId=confirmation?.dealId??opened?.dealId??null;
+
+    await env.DB.prepare(`
+      UPDATE demo_order_test_guard SET deal_id=?,deal_status=?,confirm_status=?,last_error=?,updated_at=? WHERE id=1
+    `).bind(dealId,confirmation?.dealStatus??null,confirmation?.status??null,confirmError,new Date().toISOString()).run();
+
+    let position:Obj|null=null;
+    if(dealId){
+      try{position=await get(env,'/positions/'+encodeURIComponent(String(dealId)));}catch{}
+    }
+    if(!position){
+      try{
+        const all=await get(env,'/positions');
+        if(Array.isArray(all.positions)){
+          position=all.positions.find((x:Obj)=>
+            String(x?.position?.dealId??'')===String(dealId??'') ||
+            String(x?.market?.epic??'')===epic && Number(x?.position?.size)===minSize
+          )??null;
+        }
+      }catch{}
+    }
+
+    return {
+      success:true,...INFO,module:'ONE_SHOT_DEMO_ORDER_TEST',
+      demo_only:true,manual_only:true,cron_can_execute:false,paper_engine_unchanged:true,
+      order_sent:true,order_request:{epic,direction,size:minSize,guaranteedStop:false},
+      order_response:{deal_reference:dealReference},
+      confirmation:confirmation?{
+        deal_status:confirmation.dealStatus??null,status:confirmation.status??null,
+        epic:confirmation.epic??null,direction:confirmation.direction??null,size:number(confirmation.size),
+        level:number(confirmation.level),deal_id:dealId,
+        affected_deals:affected.map((x:Obj)=>({deal_id:x?.dealId??null,status:x?.status??null}))
+      }:{available:false,error:confirmError},
+      open_position_verified:position!==null,
+      position:position?{
+        deal_id:position.position?.dealId??null,deal_reference:position.position?.dealReference??null,
+        epic:position.market?.epic??epic,direction:position.position?.direction??null,
+        size:number(position.position?.size),level:number(position.position?.level),
+        upl:number(position.position?.upl),market_status:position.market?.marketStatus??null
+      }:null,
+      guard:{consumed:true},
+      close_sent:false,
+      next_step:'Inspect this result. Closing is intentionally a separate manual test.',
+      trading:'DEMO_ONE_SHOT_TEST'
+    };
+  }catch(error){
+    const f=failure(error);
+    await env.DB.prepare(`UPDATE demo_order_test_guard SET deal_reference=COALESCE(?,deal_reference),last_error=?,updated_at=? WHERE id=1`)
+      .bind(dealReference,f.error,new Date().toISOString()).run().catch(()=>{});
+    throw error;
+  }
+}
 
 async function demoTradingDiagnostic(env: Env) {
   // READ ONLY: GET requests only. Never POST /positions or PUT account settings here.
@@ -665,7 +805,23 @@ const PAPER_MATRIX = [
 
 async function ensurePaperSchema(env: Env) {
   if(!env.DB)throw new Fault('D1_BINDING_MISSING',500);
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_observations (
+  await env.DB.prepare(`
+CREATE TABLE IF NOT EXISTS demo_order_test_guard (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  consumed INTEGER NOT NULL DEFAULT 0,
+  consumed_at TEXT,
+  epic TEXT,
+  direction TEXT,
+  size REAL,
+  deal_reference TEXT,
+  deal_id TEXT,
+  deal_status TEXT,
+  confirm_status TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+INSERT OR IGNORE INTO demo_order_test_guard(id,consumed,updated_at) VALUES(1,0,datetime('now'));
+CREATE TABLE IF NOT EXISTS paper_observations (
     id TEXT PRIMARY KEY, epic TEXT NOT NULL, side TEXT NOT NULL, status TEXT NOT NULL,
     entry_time TEXT NOT NULL, entry_price REAL NOT NULL, entry_combined_score REAL,
     entry_persistence_score REAL, entry_regime TEXT, entry_regime_streak INTEGER,
@@ -858,7 +1014,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.6.0 · Capital.com · DEMO TRADING DIAGNOSTIC · READ ONLY</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.6.1 · Capital.com · ONE-SHOT DEMO ORDER TEST</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -880,6 +1036,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="demo-trading-diag-btn" type="button">🔌 DEMO TRADING DIAG</button>
+    <button id="demo-order-test-btn" type="button">🧪 ONE-SHOT DEMO BUY GOLD 0.01</button>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -917,6 +1074,10 @@ document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Cal
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('demo-trading-diag-btn')?.addEventListener('click',()=>mpD1Call('/api/demo-trading-diagnostic'));
+document.getElementById('demo-order-test-btn')?.addEventListener('click',async()=>{
+  if(!confirm('DEMO ONLY: open ONE GOLD BUY position at the current minimum size 0.01? It will remain OPEN until we test closing separately.'))return;
+  await mpD1Call('/api/demo-order-test');
+});
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -952,7 +1113,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic', '/api/demo-order-test'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -973,6 +1134,7 @@ export default {
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
+      if (url.pathname === '/api/demo-order-test') return json(await oneShotDemoOrderTest(env));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
