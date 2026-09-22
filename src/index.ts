@@ -1,4 +1,4 @@
-// Market Pulse V1.7.0 — CONFIG + DEMO Full Cycle + Paper Analytics. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.1 — CONFIG + Signal History + Paper Analytics. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.0';
+const VERSION = '1.7.1';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1055,6 +1055,106 @@ async function paperStatus(env:Env){
     trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
 }
 
+
+async function signalHistory(env:Env){
+  await ensureSnapshotSchema(env);
+  await ensurePaperSchema(env);
+
+  // Every snapshot where the main combined score crossed the configured entry threshold.
+  const crossed=await env.DB.prepare(`
+    SELECT captured_at,epic,price,combined_score,combined_direction,
+           signal_1m,direction_1m,signal_5m,direction_5m,signal_30m,direction_30m,
+           news_score,news_bias
+    FROM market_snapshots
+    WHERE ABS(combined_score) >= ?
+    ORDER BY captured_at DESC
+    LIMIT 100
+  `).bind(CONFIG.ENTRY_SCORE).all();
+
+  const observations=await env.DB.prepare(`
+    SELECT o.*,
+      (SELECT ROUND(MAX(t.max_favorable_pct),4) FROM paper_matrix_trades t WHERE t.observation_id=o.id) AS mfe_pct,
+      (SELECT ROUND(MIN(t.max_adverse_pct),4) FROM paper_matrix_trades t WHERE t.observation_id=o.id) AS mae_pct
+    FROM paper_observations o
+    ORDER BY o.entry_time DESC
+    LIMIT 100
+  `).all();
+
+  const obsRows=(observations.results??[]) as Obj[];
+  const ids=obsRows.map(x=>String(x.id)).filter(Boolean);
+  let trades:Obj[]=[];
+  if(ids.length){
+    const placeholders=ids.map(()=>'?').join(',');
+    const r=await env.DB.prepare(`
+      SELECT observation_id,variant,status,tp_pct,sl_pct,max_hold_minutes,
+             entry_price,exit_price,exit_reason,pnl_pct,pnl_value,
+             max_favorable_pct,max_adverse_pct,entry_time,exit_time
+      FROM paper_matrix_trades
+      WHERE observation_id IN (${placeholders})
+      ORDER BY entry_time DESC,variant
+    `).bind(...ids).all();
+    trades=(r.results??[]) as Obj[];
+  }
+  const byObs=new Map<string,Obj[]>();
+  for(const t of trades){
+    const id=String(t.observation_id);
+    if(!byObs.has(id))byObs.set(id,[]);
+    byObs.get(id)!.push(t);
+  }
+
+  const qualified=obsRows.map(o=>{
+    const variants=byObs.get(String(o.id))??[];
+    const closed=variants.filter(v=>v.status==='CLOSED');
+    const avgPnl=closed.length?closed.reduce((a,v)=>a+(number(v.pnl_pct)??0),0)/closed.length:null;
+    const current=variants.find(v=>v.status==='OPEN');
+    return{
+      id:o.id,entry_time:o.entry_time,epic:o.epic,side:o.side,status:o.status,
+      entry_price:number(o.entry_price),
+      score:number(o.entry_combined_score),persistence:number(o.entry_persistence_score),
+      regime:o.entry_regime??null,regime_streak:Number(o.entry_regime_streak??0),
+      acceleration:number(o.entry_acceleration),volatility_regime:o.volatility_regime??null,
+      current_pnl_pct:current?round2(paperMovePct(String(o.side),Number(o.entry_price),Number((crossed.results??[]).find((x:Obj)=>x.epic===o.epic)?.price??o.entry_price))):null,
+      avg_closed_variant_pnl_pct:avgPnl===null?null:Math.round(avgPnl*10000)/10000,
+      mfe_pct:number(o.mfe_pct),mae_pct:number(o.mae_pct),
+      variants:variants.map(v=>({
+        id:v.variant,status:v.status,tp_pct:number(v.tp_pct),sl_pct:number(v.sl_pct),
+        max_hold_minutes:Number(v.max_hold_minutes),exit_reason:v.exit_reason??null,
+        pnl_pct:number(v.pnl_pct),pnl_value:number(v.pnl_value),
+        mfe_pct:number(v.max_favorable_pct),mae_pct:number(v.max_adverse_pct),
+        exit_time:v.exit_time??null
+      }))
+    };
+  });
+
+  const closedTrades=trades.filter(t=>t.status==='CLOSED');
+  const wins=closedTrades.filter(t=>(number(t.pnl_pct)??0)>0).length;
+  const losses=closedTrades.filter(t=>(number(t.pnl_pct)??0)<=0).length;
+  const totalPnlPct=closedTrades.reduce((a,t)=>a+(number(t.pnl_pct)??0),0);
+  const totalPnlValue=closedTrades.reduce((a,t)=>a+(number(t.pnl_value)??0),0);
+
+  return{
+    success:true,...INFO,module:'SIGNAL_HISTORY',
+    threshold:{entry_score:CONFIG.ENTRY_SCORE},
+    summary:{
+      threshold_crosses:(crossed.results??[]).length,
+      qualified_observations:qualified.length,
+      closed_variant_results:closedTrades.length,
+      wins,losses,
+      win_rate_pct:closedTrades.length?round2(wins/closedTrades.length*100):null,
+      total_pnl_pct:Math.round(totalPnlPct*10000)/10000,
+      total_pnl_value:Math.round(totalPnlValue*10000)/10000
+    },
+    qualified_signals:qualified,
+    threshold_crosses:(crossed.results??[]).map((x:Obj)=>({
+      time:x.captured_at,epic:x.epic,price:number(x.price),score:number(x.combined_score),
+      direction:x.combined_direction,signal_1m:number(x.signal_1m),signal_5m:number(x.signal_5m),
+      signal_30m:number(x.signal_30m),news_score:number(x.news_score),news_bias:x.news_bias
+    })),
+    note:'threshold_crosses contains every stored snapshot with |combined_score| >= entry threshold. qualified_signals contains signals that passed the full Paper entry filter and includes A-F P/L results.',
+    trading:CONFIG.TRADING_ENABLED?'ENABLED':'DISABLED',execution:'PAPER_ANALYTICS'
+  };
+}
+
 async function snapshotStatus(env: Env){
   await ensureSnapshotSchema(env);
   const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();
@@ -1079,7 +1179,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.0 · CONFIG · DEMO FULL CYCLE · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.1 · CONFIG · SIGNAL HISTORY · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1100,10 +1200,8 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="persistence-btn" type="button">📈 PERSISTENCE</button>
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
-    <button id="demo-trading-diag-btn" type="button">🔌 DEMO TRADING DIAG</button>
-    <button id="demo-order-test-btn" type="button">🧪 DEMO BUY GOLD 0.01</button>
+    <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
     <button id="demo-close-test-btn" type="button">🔴 CLOSE DEMO GOLD</button>
-    <button id="demo-full-cycle-btn" type="button">🔄 DEMO FULL CYCLE</button>
   </div>
   <pre id="snapshot-output">Няма стартирана D1 операция.</pre>
 </section>
@@ -1140,18 +1238,10 @@ document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD
 document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Call('/api/persistence'));
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
-document.getElementById('demo-trading-diag-btn')?.addEventListener('click',()=>mpD1Call('/api/demo-trading-diagnostic'));
-document.getElementById('demo-order-test-btn')?.addEventListener('click',async()=>{
-  if(!confirm('DEMO ONLY: open a GOLD BUY position at the current minimum size 0.01? It will remain OPEN until we test closing separately.'))return;
-  await mpD1Call('/api/demo-order-test');
-});
+document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
 document.getElementById('demo-close-test-btn')?.addEventListener('click',async()=>{
   if(!confirm('DEMO ONLY: close the first open GOLD demo position?'))return;
   await mpD1Call('/api/demo-close-test');
-});
-document.getElementById('demo-full-cycle-btn')?.addEventListener('click',async()=>{
-  if(!confirm('DEMO ONLY: open GOLD 0.01, verify it, then close the same position automatically?'))return;
-  await mpD1Call('/api/demo-full-cycle');
 });
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
@@ -1188,7 +1278,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1208,6 +1298,7 @@ export default {
       }
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
+      if (url.pathname === '/api/signal-history') return json(await signalHistory(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
       if (url.pathname === '/api/demo-close-test') return json(await closeDemoPosition(env));
