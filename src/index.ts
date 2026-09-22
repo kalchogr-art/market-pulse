@@ -4,10 +4,11 @@ interface Env {
   CAPITAL_IDENTIFIER: string;
   CAPITAL_API_PASSWORD: string;
   ADMIN_TOKEN: string;
+  DB: D1Database;
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.3.1';
+const VERSION = '1.4.0';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 class Fault extends Error {
@@ -164,7 +165,7 @@ const WATCHLIST = [
   {epic: 'OIL_CRUDE', label: 'Crude Oil', type: 'COMMODITIES'},
   {epic: 'OIL_BRENT', label: 'Brent Oil', type: 'COMMODITIES'}
 ];
-const RESOLUTIONS: Record<string, number> = {MINUTE: 60000, MINUTE_5: 300000};
+const RESOLUTIONS: Record<string, number> = {MINUTE: 60000, MINUTE_5: 300000, MINUTE_30: 1800000};
 function utcMs(value: unknown): number | null {
   if (typeof value !== 'string' || !/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)?$/.test(value)) return null;
   const timestamp = Date.parse(/(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : value + 'Z');
@@ -365,7 +366,7 @@ type NewsItem = {id:string;source_id:string;source_name:string;source_trust:numb
 function xmlText(s:string){return s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g,'$1').replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/<[^>]*>/g,' ').replace(/\s+/g,' ').trim();}
 function xmlField(block:string,tag:string){const m=block.match(new RegExp(`<${tag}(?:\\s[^>]*)?>([\\s\\S]*?)<\\/${tag}>`,'i'));return m?xmlText(m[1]):'';}
 function parseNews(xml:string,source:(typeof NEWS_FEEDS)[number]):NewsItem[]{const blocks=xml.match(/<item(?:\s[^>]*)?>[\s\S]*?<\/item>/gi)??xml.match(/<entry(?:\s[^>]*)?>[\s\S]*?<\/entry>/gi)??[];return blocks.slice(0,20).map((b,i)=>{const title=xmlField(b,'title'),desc=xmlField(b,'description')||xmlField(b,'summary')||xmlField(b,'content');let link=xmlField(b,'link');if(!link){const m=b.match(/<link[^>]+href=["']([^"']+)["']/i);link=m?.[1]??'';}const ds=xmlField(b,'pubDate')||xmlField(b,'updated')||xmlField(b,'published');const ms=ds?Date.parse(ds):NaN;const pm=Number.isFinite(ms)?ms:null;return{id:xmlField(b,'guid')||link||source.id+':'+title+':'+i,source_id:source.id,source_name:source.name,source_trust:source.trust,title,text:(title+' '+desc).trim(),url:link||null,published_at:pm!==null?new Date(pm).toISOString():ds||null,published_ms:pm,age_minutes:pm===null?null:Math.max(0,(Date.now()-pm)/60000)};});}
-async function newsFeed(source:(typeof NEWS_FEEDS)[number]){try{const r=await fetch(source.url,{headers:{'user-agent':'market-pulse-readonly/1.3.1','accept':'application/rss+xml, application/xml, text/xml, */*'}});const t=await r.text();return{source:source.id,ok:r.ok,status:r.status,items:r.ok?parseNews(t,source):[] as NewsItem[]};}catch{return{source:source.id,ok:false,status:0,items:[] as NewsItem[]};}}
+async function newsFeed(source:(typeof NEWS_FEEDS)[number]){try{const r=await fetch(source.url,{headers:{'user-agent':'market-pulse-readonly/1.4.0','accept':'application/rss+xml, application/xml, text/xml, */*'}});const t=await r.text();return{source:source.id,ok:r.ok,status:r.status,items:r.ok?parseNews(t,source):[] as NewsItem[]};}catch{return{source:source.id,ok:false,status:0,items:[] as NewsItem[]};}}
 function has(t:string,words:string[]){const x=t.toLowerCase();return words.some(w=>x.includes(w));}
 type NewsCategory='MONETARY_POLICY'|'INFLATION'|'LABOR'|'RATES'|'FX'|'ENERGY_OPEC'|'ROUTINE_DATA'|'ENFORCEMENT'|'REGULATION'|'OTHER';
 function newsCategory(t:string,source:string):NewsCategory{const x=t.toLowerCase();if(has(x,['enforcement action','enforcement actions','termination of enforcement','fraud','whistleblower','court order','charges ']))return'ENFORCEMENT';if(has(x,['euro foreign exchange reference rates','euro-short-term-rate','€str','ester','publication message','compounded_']))return'ROUTINE_DATA';if(has(x,['fomc statement','monetary policy','target range','policy rate','rate hike','rate cut','interest rate decision','economic projections','central bank rate']))return'MONETARY_POLICY';if(has(x,['cpi','consumer price','pce','inflation','price pressures','core inflation']))return'INFLATION';if(has(x,['nonfarm payroll','non-farm payroll','payrolls','unemployment','employment','labor market','labour market','jobless claims']))return'LABOR';if(has(x,['treasury yield','bond yield','interest rates','yield curve','rate expectations']))return'RATES';if(has(x,['foreign exchange','exchange rate','currency','dollar','usd','euro','eur']))return'FX';if(has(x,['opec','oil','crude','brent','petroleum','energy','production cut','output cut','inventory','inventories','supply disruption']))return'ENERGY_OPEC';if(source==='CFTC_GENERAL')return'REGULATION';return'OTHER';}
@@ -375,6 +376,96 @@ function newsDirection(epic:string,t:string,category:NewsCategory){if(['ROUTINE_
 function newsDecay(age:number|null,category:NewsCategory){if(age===null)return 0;const maxAge=category==='MONETARY_POLICY'?10080:category==='INFLATION'||category==='LABOR'?4320:category==='ENERGY_OPEC'?2880:category==='RATES'||category==='FX'?1440:360;if(age>maxAge)return 0;const halfLife=category==='MONETARY_POLICY'?2160:category==='INFLATION'||category==='LABOR'?1080:category==='ENERGY_OPEC'?720:category==='RATES'||category==='FX'?360:120;return Math.exp(-Math.LN2*age/halfLife);}
 function newsForEpic(epic:string,items:NewsItem[]){const classified=items.map(item=>{const category=newsCategory(item.text,item.source_id);const relevance=newsRelevance(epic,item.text,item.source_id,category);const direction=newsDirection(epic,item.text,category);const decay=newsDecay(item.age_minutes,category);const impact=categoryBaseImpact(category);const signed=direction*relevance/100*impact/100*decay*100;const active=relevance>=35&&impact>=35&&decay>=0.05;return{source:item.source_name,title:item.title,url:item.url,published_at:item.published_at,age_minutes:item.age_minutes===null?null:Math.round(item.age_minutes),category,relevance:Math.round(relevance),impact,decay:Math.round(decay*1000)/1000,direction:direction>0?'BULLISH':direction<0?'BEARISH':'NEUTRAL',signed_score:Math.round(signed*100)/100,active};}).sort((a,b)=>Number(b.active)-Number(a.active)||Math.abs(b.signed_score)-Math.abs(a.signed_score)||b.impact-a.impact);const active=classified.filter(x=>x.active);const directional=active.filter(x=>x.direction!=='NEUTRAL');const denom=directional.reduce((s,x)=>s+x.relevance*x.impact*x.decay,0);const score=denom?directional.reduce((s,x)=>s+x.signed_score*x.relevance*x.impact*x.decay,0)/denom:0;const categories:Record<string,number>={};for(const x of classified)categories[x.category]=(categories[x.category]||0)+1;return{epic,items_considered:classified.length,active_items:active.length,directional_active_items:directional.length,signed_score:Math.round(score*100)/100,bias:score>=5?'BULLISH':score<=-5?'BEARISH':'NEUTRAL',category_counts:categories,top_items:classified.slice(0,10)};}
 async function newsEngine(epic:string){if(!WATCHLIST.some(x=>x.epic===epic))throw new Fault('EPIC_NOT_ALLOWED',400);const results=await Promise.all(NEWS_FEEDS.map(newsFeed));const seen=new Set<string>(),items:NewsItem[]=[];for(const x of results)for(const item of x.items){const k=item.url||item.id;if(!seen.has(k)){seen.add(k);items.push(item);}}return{success:results.some(x=>x.ok),...INFO,module:'NEWS_MACRO_ENGINE',epic,fetched_at:new Date().toISOString(),source_health:{configured:results.length,working:results.filter(x=>x.ok).length,failed:results.filter(x=>!x.ok).length,sources:results.map(x=>({source:x.source,ok:x.ok,status:x.status,items:x.items.length}))},news:newsForEpic(epic,items),trading:'DISABLED',execution:'NONE',classifier_version:'1.3.1',note:'Official-source RSS research classifier with category-specific relevance, impact and time decay. Routine/enforcement items are suppressed. Direction is context, not a prediction or trade instruction.'};}
+
+
+// ============================================================
+// V1.4.0 D1 SNAPSHOT HISTORY — 1m / 5m / 30m
+// One synchronized research snapshot per epic per UTC minute.
+// No trading or order endpoints.
+// ============================================================
+const SNAPSHOT_RESOLUTIONS = ['MINUTE','MINUTE_5','MINUTE_30'] as const;
+async function ensureSnapshotSchema(env: Env) {
+  if (!env.DB) throw new Fault('D1_BINDING_MISSING', 503);
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS market_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_key TEXT NOT NULL UNIQUE,
+    captured_at TEXT NOT NULL,
+    captured_minute TEXT NOT NULL,
+    epic TEXT NOT NULL,
+    price REAL,
+    signal_1m REAL, direction_1m TEXT, candle_1m TEXT,
+    signal_5m REAL, direction_5m TEXT, candle_5m TEXT,
+    signal_30m REAL, direction_30m TEXT, candle_30m TEXT,
+    ema9_1m REAL, ema21_1m REAL, rsi14_1m REAL, atr14_1m REAL,
+    ema9_5m REAL, ema21_5m REAL, rsi14_5m REAL, atr14_5m REAL,
+    ema9_30m REAL, ema21_30m REAL, rsi14_30m REAL, atr14_30m REAL,
+    news_score REAL, news_bias TEXT,
+    combined_score REAL, combined_direction TEXT,
+    payload_json TEXT NOT NULL
+  )`).run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_market_snapshots_epic_time ON market_snapshots(epic, captured_at DESC)').run();
+  await env.DB.prepare('CREATE INDEX IF NOT EXISTS idx_market_snapshots_time ON market_snapshots(captured_at DESC)').run();
+}
+function minuteBucket(ms=Date.now()) { return new Date(Math.floor(ms/60000)*60000).toISOString(); }
+function compactSignal(x: Obj) {
+  return {ready:x?.ready===true, candle_time:x?.candle_time??null, close:number(x?.close), signal_score:number(x?.signal_score), direction:x?.direction??'NOT_READY', strength:x?.strength??null, indicators:x?.indicators??null, components:x?.components??null};
+}
+function combinedSnapshotScore(s1: Obj, s5: Obj, s30: Obj, news: Obj) {
+  const a=number(s1?.signal_score)??0, b=number(s5?.signal_score)??0, c=number(s30?.signal_score)??0, n=number(news?.signed_score)??0;
+  // 5m is the main timeframe; 30m context; 1m timing; news remains context-only at 10%.
+  const score=Math.max(-100,Math.min(100,a*0.20+b*0.40+c*0.30+n*0.10));
+  return {score:Math.round(score*100)/100,direction:score>=60?'LONG':score<=-60?'SHORT':'NEUTRAL',weights:{signal_1m:0.20,signal_5m:0.40,signal_30m:0.30,news:0.10}};
+}
+async function buildSnapshot(env: Env, epic: string, sharedNewsItems?: NewsItem[]) {
+  const histories: Obj[]=[];
+  // Sequential requests are intentional: gentler on the broker API than a 15-request burst.
+  for (const resolution of SNAPSHOT_RESOLUTIONS) histories.push(await candles(env,epic,resolution));
+  const sigs=histories.map(h=>signalFromClosed((h.candles as Obj[]).filter(x=>x.complete===true)));
+  let news: Obj;
+  if (sharedNewsItems) news=newsForEpic(epic,sharedNewsItems);
+  else news=(await newsEngine(epic)).news;
+  const c=combinedSnapshotScore(sigs[0],sigs[1],sigs[2],news);
+  const price=number(sigs[0]?.close)??number(sigs[1]?.close)??number(sigs[2]?.close);
+  return {epic,price,signal_1m:compactSignal(sigs[0]),signal_5m:compactSignal(sigs[1]),signal_30m:compactSignal(sigs[2]),news:{signed_score:news.signed_score,bias:news.bias,active_items:news.active_items,directional_active_items:news.directional_active_items},combined:c,history_stale:{minute:histories[0].history_stale,minute_5:histories[1].history_stale,minute_30:histories[2].history_stale}};
+}
+async function fetchSharedNewsItems(){const results=await Promise.all(NEWS_FEEDS.map(newsFeed));const seen=new Set<string>(),items:NewsItem[]=[];for(const x of results)for(const item of x.items){const k=item.url||item.id;if(!seen.has(k)){seen.add(k);items.push(item);}}return{results,items};}
+async function saveSnapshot(env: Env, snapshot: Obj, capturedAt: string) {
+  const minute=minuteBucket(Date.parse(capturedAt));
+  const key=snapshot.epic+'|'+minute;
+  const s1=snapshot.signal_1m??{},s5=snapshot.signal_5m??{},s30=snapshot.signal_30m??{};
+  const i1=s1.indicators??{},i5=s5.indicators??{},i30=s30.indicators??{};
+  const r=await env.DB.prepare(`INSERT OR IGNORE INTO market_snapshots (
+    snapshot_key,captured_at,captured_minute,epic,price,
+    signal_1m,direction_1m,candle_1m,signal_5m,direction_5m,candle_5m,signal_30m,direction_30m,candle_30m,
+    ema9_1m,ema21_1m,rsi14_1m,atr14_1m,ema9_5m,ema21_5m,rsi14_5m,atr14_5m,ema9_30m,ema21_30m,rsi14_30m,atr14_30m,
+    news_score,news_bias,combined_score,combined_direction,payload_json
+  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    key,capturedAt,minute,snapshot.epic,snapshot.price,
+    s1.signal_score,s1.direction,s1.candle_time,s5.signal_score,s5.direction,s5.candle_time,s30.signal_score,s30.direction,s30.candle_time,
+    i1.ema9,i1.ema21,i1.rsi14,i1.atr14,i5.ema9,i5.ema21,i5.rsi14,i5.atr14,i30.ema9,i30.ema21,i30.rsi14,i30.atr14,
+    snapshot.news?.signed_score,snapshot.news?.bias,snapshot.combined?.score,snapshot.combined?.direction,JSON.stringify(snapshot)
+  ).run();
+  return {snapshot_key:key,inserted:(r.meta?.changes??0)>0};
+}
+async function snapshotRun(env: Env) {
+  await ensureSnapshotSchema(env);
+  const capturedAt=new Date().toISOString();
+  const shared=await fetchSharedNewsItems();
+  const rows:Obj[]=[];
+  for(const item of WATCHLIST){
+    try{const snap=await buildSnapshot(env,item.epic,shared.items);const saved=await saveSnapshot(env,snap,capturedAt);rows.push({success:true,...saved,...snap});}
+    catch(error){rows.push({success:false,epic:item.epic,...failure(error)});}
+  }
+  return {success:rows.some(x=>x.success),...INFO,module:'D1_SNAPSHOT_HISTORY',captured_at:capturedAt,timeframes:['1m','5m','30m'],source_health:{news_working:shared.results.filter(x=>x.ok).length,news_configured:shared.results.length},inserted:rows.filter(x=>x.inserted).length,duplicates:rows.filter(x=>x.success&&!x.inserted).length,failed:rows.filter(x=>!x.success).length,snapshots:rows,trading:'DISABLED',execution:'NONE',note:'Research snapshots only. One row per epic per UTC minute; duplicate CRON retries are ignored.'};
+}
+async function snapshotHistory(env: Env, epic: string, limitRaw: string|null) {
+  await ensureSnapshotSchema(env);
+  if(!WATCHLIST.some(x=>x.epic===epic))throw new Fault('EPIC_NOT_ALLOWED',400);
+  const limit=Math.max(1,Math.min(500,Number(limitRaw)||60));
+  const r=await env.DB.prepare(`SELECT captured_at,epic,price,signal_1m,direction_1m,signal_5m,direction_5m,signal_30m,direction_30m,news_score,news_bias,combined_score,combined_direction FROM market_snapshots WHERE epic=? ORDER BY captured_at DESC LIMIT ?`).bind(epic,limit).all();
+  return {success:true,...INFO,module:'D1_SNAPSHOT_HISTORY',epic,count:r.results?.length??0,rows:r.results??[],trading:'DISABLED'};
+}
+async function snapshotStatus(env: Env){await ensureSnapshotSchema(env);const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();const byEpic=await env.DB.prepare('SELECT epic, COUNT(*) AS count, MAX(captured_at) AS last_snapshot FROM market_snapshots GROUP BY epic ORDER BY epic').all();return{success:true,...INFO,module:'D1_SNAPSHOT_STATUS',total:total??{},by_epic:byEpic.results??[],timeframes:['1m','5m','30m'],trading:'DISABLED'};}
 
 const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Market Pulse</title>
 <style>
@@ -426,7 +517,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -437,6 +528,9 @@ export default {
       if (url.pathname === '/api/candles') return json(await candles(env, url.searchParams.get('epic') ?? '', url.searchParams.get('resolution') ?? 'MINUTE'));
       if (url.pathname === '/api/signal') return json(await signal(env, url.searchParams.get('epic') ?? 'EURUSD', url.searchParams.get('resolution') ?? 'MINUTE_5'));
       if (url.pathname === '/api/news') return json(await newsEngine(url.searchParams.get('epic') ?? 'EURUSD'));
+      if (url.pathname === '/api/snapshot-run') return json(await snapshotRun(env));
+      if (url.pathname === '/api/snapshots') return json(await snapshotHistory(env, url.searchParams.get('epic') ?? 'EURUSD', url.searchParams.get('limit')));
+      if (url.pathname === '/api/snapshot-status') return json(await snapshotStatus(env));
       if (url.pathname === '/api/check') {
         const data = await get(env, '/accounts');
         if (!Array.isArray(data.accounts)) throw new Fault('CAPITAL_INVALID_ACCOUNTS_RESPONSE');
@@ -455,5 +549,8 @@ export default {
     } catch (error) {
       return json({...INFO, ...failure(error)}, error instanceof Fault ? error.status : 500);
     }
+  },
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(snapshotRun(env).then(()=>undefined).catch(()=>undefined));
   }
 };
