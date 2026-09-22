@@ -1,4 +1,4 @@
-// Market Pulse V1.7.2 — Signal Event Tracker + Visual History. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.3 — Clean Signal History + TP/SL Matrix. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.2';
+const VERSION = '1.7.3';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1139,44 +1139,76 @@ async function paperStatus(env:Env){
 async function signalHistory(env:Env){
   await ensureSignalEventSchema(env);
   await ensurePaperSchema(env);
-  const r=await env.DB.prepare(`SELECT * FROM signal_events ORDER BY start_time DESC LIMIT 100`).all();
-  const rows=(r.results??[]) as Obj[];
-  const events=rows.map(x=>{
-    const start=Date.parse(String(x.start_time)),end=Date.parse(String(x.end_time??x.last_above_time));
-    const duration=Math.max(1,Math.round((end-start)/60000)+1);
-    const entry=Number(x.entry_price),last=Number(x.last_price);
-    const pnl=signalEventMove(String(x.side),entry,last);
+
+  const er=await env.DB.prepare(`SELECT * FROM signal_events ORDER BY start_time DESC LIMIT 100`).all();
+  const events=(er.results??[]) as Obj[];
+
+  const mr=await env.DB.prepare(`SELECT variant,tp_pct,sl_pct,
+    COUNT(*) trades,
+    SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    SUM(CASE WHEN status='CLOSED' AND pnl_pct<=0 THEN 1 ELSE 0 END) losses,
+    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) avg_pnl_pct,
+    ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_pct ELSE 0 END),4) total_pnl_pct
+    FROM paper_matrix_trades
+    GROUP BY variant,tp_pct,sl_pct ORDER BY variant`).all();
+
+  const matrix=((mr.results??[]) as Obj[]).map(x=>{
+    const closed=Number(x.closed??0),wins=Number(x.wins??0);
     return{
-      time:x.start_time,asset:x.epic,side:x.side,status:x.status,
-      entry_price:entry,last_price:last,
-      entry_score:number(x.entry_score),peak_score:number(x.peak_score),
-      duration_min:duration,samples:Number(x.samples??1),
-      result_pct:Math.round(pnl*1000)/1000,
-      mfe_pct:Math.round(Number(x.max_favorable_pct??0)*1000)/1000,
-      mae_pct:Math.round(Number(x.max_adverse_pct??0)*1000)/1000,
-      filter:x.qualified?'QUALIFIED':'REJECTED',
-      reason:x.qualification_reason??null,
-      persistence:number(x.persistence_score),
-      streak:Number(x.regime_streak??0),
-      acceleration:number(x.acceleration)
+      variant:x.variant,
+      tp_pct:number(x.tp_pct),
+      sl_pct:number(x.sl_pct),
+      closed,
+      wins,
+      losses:Number(x.losses??0),
+      win_rate_pct:closed?round2(wins/closed*100):null,
+      avg_pnl_pct:number(x.avg_pnl_pct),
+      total_pnl_pct:number(x.total_pnl_pct)
     };
   });
-  const closed=events.filter(x=>x.status==='CLOSED');
-  const wins=closed.filter(x=>x.result_pct>0).length,losses=closed.filter(x=>x.result_pct<=0).length;
-  const avg=closed.length?closed.reduce((a,x)=>a+x.result_pct,0)/closed.length:null;
-  const q=events.filter(x=>x.filter==='QUALIFIED'),rej=events.filter(x=>x.filter==='REJECTED');
-  const stats=(arr:typeof events)=>{
-    const c=arr.filter(x=>x.status==='CLOSED');
-    const w=c.filter(x=>x.result_pct>0).length;
-    return{signals:arr.length,closed:c.length,wins:w,losses:c.length-w,
-      win_rate_pct:c.length?round2(w/c.length*100):null,
-      avg_result_pct:c.length?Math.round(c.reduce((a,x)=>a+x.result_pct,0)/c.length*1000)/1000:null};
+
+  const rows=events.map(x=>{
+    const start=Date.parse(String(x.start_time)),end=Date.parse(String(x.end_time??x.last_above_time));
+    const pnl=signalEventMove(String(x.side),Number(x.entry_price),Number(x.last_price));
+    return{
+      time:x.start_time,
+      asset:x.epic,
+      side:x.side,
+      status:x.status,
+      filter:x.qualified?'QUALIFIED':'REJECTED',
+      entry:number(x.entry_price),
+      last:number(x.last_price),
+      score:number(x.entry_score),
+      peak:number(x.peak_score),
+      duration_min:Math.max(1,Math.round((end-start)/60000)+1),
+      pnl_pct:Math.round(pnl*1000)/1000,
+      mfe_pct:Math.round(Number(x.max_favorable_pct??0)*1000)/1000,
+      mae_pct:Math.round(Number(x.max_adverse_pct??0)*1000)/1000,
+      persistence:number(x.persistence_score),
+      streak:Number(x.regime_streak??0),
+      acceleration:number(x.acceleration),
+      reason:x.qualified?null:(x.qualification_reason??null)
+    };
+  });
+
+  const closed=rows.filter(x=>x.status==='CLOSED');
+  const wins=closed.filter(x=>x.pnl_pct>0).length;
+  return{
+    success:true,
+    version:VERSION,
+    signal_history:{
+      signals:rows.length,
+      open:rows.filter(x=>x.status==='OPEN').length,
+      closed:closed.length,
+      wins,
+      losses:closed.length-wins,
+      win_rate_pct:closed.length?round2(wins/closed.length*100):null,
+      rows
+    },
+    tp_sl_matrix:matrix,
+    note:'Keep all A-F variants until the sample is large enough. No automatic best TP/SL selection is made.'
   };
-  return{success:true,...INFO,module:'SIGNAL_HISTORY',
-    summary:{signals:events.length,open:events.filter(x=>x.status==='OPEN').length,closed:closed.length,wins,losses,
-      win_rate_pct:closed.length?round2(wins/closed.length*100):null,avg_result_pct:avg===null?null:Math.round(avg*1000)/1000},
-    qualified:stats(q),rejected:stats(rej),signals:events,
-    threshold:CONFIG.ENTRY_SCORE,trading:CONFIG.TRADING_ENABLED?'ENABLED':'DISABLED'};
 }
 
 async function snapshotStatus(env: Env){
@@ -1203,7 +1235,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.2 · SIGNAL EVENTS · VISUAL HISTORY · PAPER ANALYTICS</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.3 · CLEAN SIGNAL HISTORY · TP/SL MATRIX</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1265,25 +1297,22 @@ async function mpD1Call(path) {
 function renderSignalHistory(data){
   const view=document.getElementById('signal-history-view'),summary=document.getElementById('signal-summary'),list=document.getElementById('signal-list');
   view.style.display='block';summary.replaceChildren();list.replaceChildren();
-  const stats=[
-    ['Signals',data.summary?.signals??0],['Open',data.summary?.open??0],['Closed',data.summary?.closed??0],
-    ['Wins',data.summary?.wins??0],['Losses',data.summary?.losses??0],
-    ['Win rate',data.summary?.win_rate_pct==null?'—':data.summary.win_rate_pct+'%'],
-    ['Avg result',data.summary?.avg_result_pct==null?'—':data.summary.avg_result_pct+'%']
-  ];
+  const h=data.signal_history??{};
+  const stats=[['Signals',h.signals??0],['Open',h.open??0],['Closed',h.closed??0],['Wins',h.wins??0],['Losses',h.losses??0],['Win rate',h.win_rate_pct==null?'—':h.win_rate_pct+'%']];
   for(const [k,v] of stats){const d=document.createElement('div');d.className='sig-stat';d.innerHTML='<small>'+k+'</small><b>'+v+'</b>';summary.appendChild(d);}
-  for(const x of data.signals??[]){
-    const d=document.createElement('div');d.className='sig-card';
-    const pnl=Number(x.result_pct),pcls=pnl>0?'good':pnl<0?'bad':'muted';
-    const filter=x.filter==='QUALIFIED'?'<span class="good">QUALIFIED</span>':'<span class="warn">REJECTED</span>';
-    const dt=new Date(x.time).toLocaleString('bg-BG',{timeZone:'Europe/Sofia'});
-    d.innerHTML='<div class="sig-top"><b>'+x.asset+' · '+x.side+'</b><b class="'+pcls+'">'+(pnl>0?'+':'')+pnl.toFixed(3)+'%</b></div>'+
-      '<div class="sig-meta"><span>'+dt+'</span><span>'+x.status+'</span><span>'+filter+'</span><span>'+x.duration_min+' min</span></div>'+
-      '<div class="sig-meta"><span>Entry '+x.entry_price+'</span><span>Last '+x.last_price+'</span><span>Score '+x.entry_score+' → peak '+x.peak_score+'</span></div>'+
-      '<div class="sig-meta"><span>MFE '+x.mfe_pct+'%</span><span>MAE '+x.mae_pct+'%</span><span>Persistence '+(x.persistence??'—')+'</span><span>Streak '+x.streak+'</span><span>Accel '+(x.acceleration??'—')+'</span></div>'+
-      (x.filter==='REJECTED'?'<div class="sig-meta"><span>Reason: '+(x.reason??'—')+'</span></div>':'');
-    list.appendChild(d);
+
+  const mt=document.createElement('div');mt.className='sig-card';
+  let mh='<b>TP / SL MATRIX</b><div class="scroll"><table><thead><tr><th>Variant</th><th>TP</th><th>SL</th><th>Closed</th><th>W</th><th>L</th><th>Win %</th><th>Avg P/L</th><th>Total P/L</th></tr></thead><tbody>';
+  for(const x of data.tp_sl_matrix??[])mh+='<tr><td>'+x.variant+'</td><td>'+x.tp_pct+'%</td><td>'+x.sl_pct+'%</td><td>'+x.closed+'</td><td>'+x.wins+'</td><td>'+x.losses+'</td><td>'+(x.win_rate_pct??'—')+'</td><td>'+(x.avg_pnl_pct??'—')+'%</td><td>'+(x.total_pnl_pct??'—')+'%</td></tr>';
+  mt.innerHTML=mh+'</tbody></table></div>';list.appendChild(mt);
+
+  const rows=document.createElement('div');rows.className='sig-card';
+  let rh='<b>SIGNAL ROWS</b><div class="scroll"><table><thead><tr><th>Sofia</th><th>Asset</th><th>Side</th><th>Filter</th><th>Status</th><th>Score</th><th>Peak</th><th>Entry</th><th>Last</th><th>P/L</th><th>MFE</th><th>MAE</th><th>Min</th><th>Reason</th></tr></thead><tbody>';
+  for(const x of h.rows??[]){
+    const dt=new Date(x.time).toLocaleString('bg-BG',{timeZone:'Europe/Sofia',day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});
+    rh+='<tr><td>'+dt+'</td><td>'+x.asset+'</td><td>'+x.side+'</td><td>'+x.filter+'</td><td>'+x.status+'</td><td>'+x.score+'</td><td>'+x.peak+'</td><td>'+x.entry+'</td><td>'+x.last+'</td><td>'+x.pnl_pct+'%</td><td>'+x.mfe_pct+'%</td><td>'+x.mae_pct+'%</td><td>'+x.duration_min+'</td><td>'+(x.reason??'—')+'</td></tr>';
   }
+  rows.innerHTML=rh+'</tbody></table></div>';list.appendChild(rows);
 }
 document.getElementById('run-snapshot-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-run'));
 document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-status'));
