@@ -1,4 +1,4 @@
-// Market Pulse V1.7.3 — Clean Signal History + TP/SL Matrix. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.4 — Signal History Backfill + TP/SL Matrix. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.3';
+const VERSION = '1.7.4';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1136,6 +1136,36 @@ async function paperStatus(env:Env){
 }
 
 
+
+async function signalHistoryBackfill(env:Env){
+  await ensureSnapshotSchema(env); await ensureSignalEventSchema(env);
+  const existing=await env.DB.prepare(`SELECT COUNT(*) c FROM signal_events`).first<Obj>();
+  if(Number(existing?.c??0)>0)return{success:true,version:VERSION,module:'SIGNAL_HISTORY_BACKFILL',skipped:true,reason:'SIGNAL_EVENTS_ALREADY_EXIST',existing:Number(existing?.c??0)};
+  const rr=await env.DB.prepare(`SELECT captured_at,epic,price,combined_score FROM market_snapshots WHERE combined_score IS NOT NULL ORDER BY epic,captured_at`).all();
+  const rows=(rr.results??[]) as Obj[], groups=new Map<string,Obj[]>();
+  for(const r of rows){const k=String(r.epic);if(!groups.has(k))groups.set(k,[]);groups.get(k)!.push(r);}
+  let created=0,thresholdRows=0; const now=new Date().toISOString();
+  for(const [epic,arr] of groups){
+    let ev:Obj|null=null;
+    const flush=async()=>{if(!ev)return;const id='hist_'+epic+'_'+Date.parse(String(ev.start_time));
+      await env.DB.prepare(`INSERT OR IGNORE INTO signal_events (id,epic,side,status,start_time,last_above_time,end_time,entry_price,last_price,peak_score,entry_score,last_score,samples,max_favorable_pct,max_adverse_pct,qualified,qualification_reason,persistence_score,regime_streak,acceleration,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(id,epic,ev.side,'CLOSED',ev.start_time,ev.last_above_time,ev.end_time,ev.entry_price,ev.last_price,ev.peak_score,ev.entry_score,ev.last_score,ev.samples,ev.mfe,ev.mae,0,'HISTORICAL_BACKFILL',null,0,null,now,now).run();created++;ev=null;};
+    for(const row of arr){
+      const score=number(row.combined_score),price=number(row.price);if(score===null||price===null)continue;
+      const side=score>=CONFIG.ENTRY_SCORE?'LONG':score<=-CONFIG.ENTRY_SCORE?'SHORT':null;if(side)thresholdRows++;
+      const t=Date.parse(String(row.captured_at));
+      if(ev){
+        const contiguous=t-Date.parse(String(ev.last_above_time))<=120000;
+        if(side===ev.side&&contiguous){const mv=signalEventMove(String(ev.side),Number(ev.entry_price),price);ev.last_above_time=row.captured_at;ev.end_time=row.captured_at;ev.last_price=price;ev.last_score=score;ev.samples++;ev.peak_score=side==='LONG'?Math.max(Number(ev.peak_score),score):Math.min(Number(ev.peak_score),score);ev.mfe=Math.max(Number(ev.mfe),mv);ev.mae=Math.min(Number(ev.mae),mv);continue;}
+        await flush();
+      }
+      if(side)ev={side,start_time:row.captured_at,last_above_time:row.captured_at,end_time:row.captured_at,entry_price:price,last_price:price,peak_score:score,entry_score:score,last_score:score,samples:1,mfe:0,mae:0};
+    }
+    await flush();
+  }
+  return{success:true,version:VERSION,module:'SIGNAL_HISTORY_BACKFILL',snapshots_scanned:rows.length,threshold_rows:thresholdRows,signal_events_created:created};
+}
+
 async function signalHistory(env:Env){
   await ensureSignalEventSchema(env);
   await ensurePaperSchema(env);
@@ -1235,7 +1265,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.3 · CLEAN SIGNAL HISTORY · TP/SL MATRIX</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.4 · SIGNAL HISTORY BACKFILL · TP/SL MATRIX</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1257,6 +1287,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
+    <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
   </div>
   <div id="signal-history-view" style="display:none">
     <div class="sig-summary" id="signal-summary"></div>
@@ -1320,6 +1351,7 @@ document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Cal
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
+document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1355,7 +1387,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1376,6 +1408,7 @@ export default {
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/signal-history') return json(await signalHistory(env));
+      if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
       if (url.pathname === '/api/demo-close-test') return json(await closeDemoPosition(env));
