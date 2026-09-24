@@ -1,4 +1,4 @@
-// Market Pulse V1.7.5 — Score Distribution Diagnostic. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.5 re— Score Distribution Diagnostic. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
