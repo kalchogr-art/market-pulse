@@ -1,4 +1,4 @@
-// Market Pulse V1.7.5 re— Score Distribution Diagnostic. READ ONLY. No trading endpoints.
+// Market Pulse V1.7.5 — Score Distribution Diagnostic. READ ONLY. No trading endpoints.
 interface Env {
   CAPITAL_API_KEY: string;
   CAPITAL_IDENTIFIER: string;
@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.5';
+const VERSION = '1.7.6';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1138,6 +1138,32 @@ async function paperStatus(env:Env){
 
 
 
+async function entryFilterDiagnostic(env:Env){
+  await ensureSignalEventSchema(env);
+  const rr=await env.DB.prepare(`SELECT epic,side,start_time,entry_score,max_favorable_pct,max_adverse_pct,qualified,qualification_reason,persistence_score,regime_streak,acceleration FROM signal_events ORDER BY start_time DESC`).all();
+  const rows=(rr.results??[]) as Obj[];
+  const summary:Obj={signals:rows.length,qualified:0,rejected:0,failed_persistence:0,failed_streak:0,failed_acceleration:0,failed_one_filter:0,failed_two_filters:0,failed_three_filters:0,rejected_wins:0,rejected_losses:0,rejected_flat:0};
+  const only:Obj={persistence:{count:0,wins:0,losses:0},streak:{count:0,wins:0,losses:0},acceleration:{count:0,wins:0,losses:0}};
+  const details:Obj[]=[];
+  for(const r of rows){
+    if(Number(r.qualified)===1){summary.qualified++;continue;} summary.rejected++;
+    const p=number(r.persistence_score),st=number(r.regime_streak),ac=number(r.acceleration),fails:string[]=[];
+    if(p===null||Math.abs(p)<CONFIG.PERSISTENCE_SCORE){summary.failed_persistence++;fails.push('PERSISTENCE');}
+    if(st===null||st<CONFIG.MIN_REGIME_STREAK){summary.failed_streak++;fails.push('STREAK');}
+    if(ac===null||Math.abs(ac)<CONFIG.MIN_ABS_ACCELERATION){summary.failed_acceleration++;fails.push('ACCELERATION');}
+    summary['failed_'+(fails.length===1?'one':fails.length===2?'two':'three')+'_filter'+(fails.length===1?'':'s')]=(summary['failed_'+(fails.length===1?'one':fails.length===2?'two':'three')+'_filter'+(fails.length===1?'':'s')]??0)+1;
+    const mfe=number(r.max_favorable_pct)??0,mae=Math.abs(number(r.max_adverse_pct)??0),o=mfe>mae?'WIN':mfe<mae?'LOSS':'FLAT';
+    summary['rejected_'+o.toLowerCase()+(o==='LOSS'?'es':'s')]=(summary['rejected_'+o.toLowerCase()+(o==='LOSS'?'es':'s')]??0)+1;
+    if(fails.length===1){const k=fails[0].toLowerCase();only[k].count++;only[k][o.toLowerCase()+(o==='LOSS'?'es':'s')]=(only[k][o.toLowerCase()+(o==='LOSS'?'es':'s')]??0)+1;}
+    details.push({time:r.start_time,asset:r.epic,side:r.side,score:r.entry_score,persistence:p,streak:st,acceleration:ac,failed:fails,outcome:o,mfe_pct:r.max_favorable_pct,mae_pct:r.max_adverse_pct});
+  }
+  const rate=(w:number,l:number)=>w+l?round(w/(w+l)*100,2):null;
+  summary.qualification_rate_pct=rows.length?round(summary.qualified/rows.length*100,2):null;
+  summary.rejected_win_rate_pct=rate(summary.rejected_wins,summary.rejected_losses);
+  for(const k of Object.keys(only))only[k].win_rate_pct=rate(only[k].wins??0,only[k].losses??0);
+  return{success:true,worker:'market-pulse',version:VERSION,module:'ENTRY_FILTER_DIAGNOSTIC',config:{entry_score:CONFIG.ENTRY_SCORE,persistence_score:CONFIG.PERSISTENCE_SCORE,min_regime_streak:CONFIG.MIN_REGIME_STREAK,min_abs_acceleration:CONFIG.MIN_ABS_ACCELERATION},summary,failed_only:only,rejected_rows:details.slice(0,100)};
+}
+
 async function scoreDistribution(env:Env){
   await ensureSnapshotSchema(env);
   const rr=await env.DB.prepare(`SELECT captured_at,epic,combined_score FROM market_snapshots WHERE combined_score IS NOT NULL ORDER BY epic,captured_at`).all();
@@ -1328,7 +1354,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
-    <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>
+    <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>\n    <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
     <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
   </div>
   <div id="signal-history-view" style="display:none">
@@ -1393,7 +1419,7 @@ document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Cal
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
-document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));
+document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));\ndocument.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
 document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
@@ -1430,7 +1456,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1451,7 +1477,7 @@ export default {
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/signal-history') return json(await signalHistory(env));
-      if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));
+      if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));\n      if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
