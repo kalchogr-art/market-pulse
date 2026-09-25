@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.6';
+const VERSION = '1.7.7';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1003,17 +1003,26 @@ function paperMovePct(side:string, entry:number, price:number){
 async function latestSnapshotRow(env: Env, epic:string){
   return await env.DB.prepare(`SELECT captured_at,price,combined_score,combined_direction FROM market_snapshots WHERE epic=? ORDER BY captured_at DESC LIMIT 1`).bind(epic).first<Obj>();
 }
-function paperEntryDecision(snap:Obj,p:Obj){
+function qualifyEntry(snap:Obj,p:Obj){
   const score=number(snap.combined_score), ps=number(p.persistence?.score), acc=number(p.persistence?.acceleration);
   const bias=String(p.persistence?.bias??'NOT_READY'), streak=Number(p.regime_streak?.count??0);
-  if(score===null||ps===null||acc===null)return{eligible:false,reason:'NOT_READY'};
-  if(streak<PAPER_CFG.min_regime_streak)return{eligible:false,reason:'REGIME_STREAK_TOO_SHORT'};
-  if(score>=PAPER_CFG.entry_score&&ps>=PAPER_CFG.persistence_score&&bias==='BULLISH'&&acc>=PAPER_CFG.min_abs_acceleration)
-    return{eligible:true,side:'LONG',reason:'LONG_CONFIRMED'};
-  if(score<=-PAPER_CFG.entry_score&&ps<=-PAPER_CFG.persistence_score&&bias==='BEARISH'&&acc<=-PAPER_CFG.min_abs_acceleration)
-    return{eligible:true,side:'SHORT',reason:'SHORT_CONFIRMED'};
-  return{eligible:false,reason:'ENTRY_FILTER_NOT_MET'};
+  const side=score!==null&&score>=CONFIG.ENTRY_SCORE?'LONG':score!==null&&score<=-CONFIG.ENTRY_SCORE?'SHORT':null;
+  const failed:string[]=[];
+  if(score===null||ps===null||acc===null||bias==='NOT_READY')return{eligible:false,side,reason:'NOT_READY',failed:['NOT_READY'],score,persistence:ps,streak,acceleration:acc,bias};
+  if(!side)failed.push('SCORE');
+  if(side==='LONG'){
+    if(ps<CONFIG.PERSISTENCE_SCORE||bias!=='BULLISH')failed.push('PERSISTENCE');
+    if(streak<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');
+    if(acc<CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');
+  }else if(side==='SHORT'){
+    if(ps>-CONFIG.PERSISTENCE_SCORE||bias!=='BEARISH')failed.push('PERSISTENCE');
+    if(streak<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');
+    if(acc>-CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');
+  }
+  const eligible=failed.length===0&&side!==null;
+  return{eligible,side,reason:eligible?(side==='LONG'?'LONG_CONFIRMED':'SHORT_CONFIRMED'):failed.join('+'),failed,score,persistence:ps,streak,acceleration:acc,bias};
 }
+function paperEntryDecision(snap:Obj,p:Obj){ return qualifyEntry(snap,p); }
 
 async function entryVolatility(env:Env,epic:string,price:number){
   const frames=[['MINUTE','atr_1m','atr_pct_1m'],['MINUTE_5','atr_5m','atr_pct_5m'],['MINUTE_30','atr_30m','atr_pct_30m']] as const;
@@ -1146,22 +1155,60 @@ async function entryFilterDiagnostic(env:Env){
   const only:Obj={persistence:{count:0,wins:0,losses:0},streak:{count:0,wins:0,losses:0},acceleration:{count:0,wins:0,losses:0}};
   const details:Obj[]=[];
   for(const r of rows){
-    if(Number(r.qualified)===1){summary.qualified++;continue;} summary.rejected++;
-    const p=number(r.persistence_score),st=number(r.regime_streak),ac=number(r.acceleration),fails:string[]=[];
-    if(p===null||Math.abs(p)<CONFIG.PERSISTENCE_SCORE){summary.failed_persistence++;fails.push('PERSISTENCE');}
-    if(st===null||st<CONFIG.MIN_REGIME_STREAK){summary.failed_streak++;fails.push('STREAK');}
-    if(ac===null||Math.abs(ac)<CONFIG.MIN_ABS_ACCELERATION){summary.failed_acceleration++;fails.push('ACCELERATION');}
-    summary['failed_'+(fails.length===1?'one':fails.length===2?'two':'three')+'_filter'+(fails.length===1?'':'s')]=(summary['failed_'+(fails.length===1?'one':fails.length===2?'two':'three')+'_filter'+(fails.length===1?'':'s')]??0)+1;
+    const score=number(r.entry_score),ps=number(r.persistence_score),st=Number(r.regime_streak??0),ac=number(r.acceleration),side=String(r.side);
+    const failed:string[]=[];
+    if(ps===null||ac===null){failed.push('NOT_READY');}
+    else{
+      if(side==='LONG'){
+        if(ps<CONFIG.PERSISTENCE_SCORE)failed.push('PERSISTENCE');
+        if(st<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');
+        if(ac<CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');
+      }else if(side==='SHORT'){
+        if(ps>-CONFIG.PERSISTENCE_SCORE)failed.push('PERSISTENCE');
+        if(st<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');
+        if(ac>-CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');
+      }
+    }
+    const eligible=failed.length===0 && score!==null && Math.abs(score)>=CONFIG.ENTRY_SCORE;
+    if(eligible){summary.qualified++;continue;}
+    summary.rejected++;
+    if(failed.includes('PERSISTENCE'))summary.failed_persistence++;
+    if(failed.includes('STREAK'))summary.failed_streak++;
+    if(failed.includes('ACCELERATION'))summary.failed_acceleration++;
+    const filterFails=failed.filter(x=>x!=='NOT_READY');
+    if(filterFails.length===1)summary.failed_one_filter++;
+    if(filterFails.length===2)summary.failed_two_filters++;
+    if(filterFails.length===3)summary.failed_three_filters++;
     const mfe=number(r.max_favorable_pct)??0,mae=Math.abs(number(r.max_adverse_pct)??0),o=mfe>mae?'WIN':mfe<mae?'LOSS':'FLAT';
-    summary['rejected_'+o.toLowerCase()+(o==='LOSS'?'es':'s')]=(summary['rejected_'+o.toLowerCase()+(o==='LOSS'?'es':'s')]??0)+1;
-    if(fails.length===1){const k=fails[0].toLowerCase();only[k].count++;only[k][o.toLowerCase()+(o==='LOSS'?'es':'s')]=(only[k][o.toLowerCase()+(o==='LOSS'?'es':'s')]??0)+1;}
-    details.push({time:r.start_time,asset:r.epic,side:r.side,score:r.entry_score,persistence:p,streak:st,acceleration:ac,failed:fails,outcome:o,mfe_pct:r.max_favorable_pct,mae_pct:r.max_adverse_pct});
+    if(o==='WIN')summary.rejected_wins++;else if(o==='LOSS')summary.rejected_losses++;else summary.rejected_flat++;
+    if(filterFails.length===1){
+      const k=filterFails[0].toLowerCase();only[k].count++;
+      if(o==='WIN')only[k].wins++;else if(o==='LOSS')only[k].losses++;
+    }
+    details.push({time:r.start_time,asset:r.epic,side,score,persistence:ps,streak:st,acceleration:ac,failed,outcome:o,mfe_pct:r.max_favorable_pct,mae_pct:r.max_adverse_pct,stored_qualified:Number(r.qualified)===1});
   }
   const rate=(w:number,l:number)=>w+l?round(w/(w+l)*100,2):null;
   summary.qualification_rate_pct=rows.length?round(summary.qualified/rows.length*100,2):null;
   summary.rejected_win_rate_pct=rate(summary.rejected_wins,summary.rejected_losses);
   for(const k of Object.keys(only))only[k].win_rate_pct=rate(only[k].wins??0,only[k].losses??0);
-  return{success:true,worker:'market-pulse',version:VERSION,module:'ENTRY_FILTER_DIAGNOSTIC',config:{entry_score:CONFIG.ENTRY_SCORE,persistence_score:CONFIG.PERSISTENCE_SCORE,min_regime_streak:CONFIG.MIN_REGIME_STREAK,min_abs_acceleration:CONFIG.MIN_ABS_ACCELERATION},summary,failed_only:only,rejected_rows:details.slice(0,100)};
+  return{success:true,worker:'market-pulse',version:VERSION,module:'UNIFIED_ENTRY_FILTER_DIAGNOSTIC',config:{entry_score:CONFIG.ENTRY_SCORE,persistence_score:CONFIG.PERSISTENCE_SCORE,min_regime_streak:CONFIG.MIN_REGIME_STREAK,min_abs_acceleration:CONFIG.MIN_ABS_ACCELERATION},summary,failed_only:only,rejected_rows:details.slice(0,100)};
+}
+
+async function repairSignalQualifications(env:Env){
+  await ensureSignalEventSchema(env);
+  const rr=await env.DB.prepare(`SELECT id,side,entry_score,persistence_score,regime_streak,acceleration FROM signal_events`).all();
+  let qualified=0,rejected=0,updated=0;
+  for(const r of (rr.results??[]) as Obj[]){
+    const score=number(r.entry_score),ps=number(r.persistence_score),st=Number(r.regime_streak??0),ac=number(r.acceleration),side=String(r.side);
+    const failed:string[]=[];
+    if(score===null||Math.abs(score)<CONFIG.ENTRY_SCORE)failed.push('SCORE');
+    if(ps===null||ac===null)failed.push('NOT_READY');
+    else if(side==='LONG'){if(ps<CONFIG.PERSISTENCE_SCORE)failed.push('PERSISTENCE');if(st<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');if(ac<CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');}
+    else if(side==='SHORT'){if(ps>-CONFIG.PERSISTENCE_SCORE)failed.push('PERSISTENCE');if(st<CONFIG.MIN_REGIME_STREAK)failed.push('STREAK');if(ac>-CONFIG.MIN_ABS_ACCELERATION)failed.push('ACCELERATION');}
+    const ok=failed.length===0; if(ok)qualified++;else rejected++;
+    await env.DB.prepare(`UPDATE signal_events SET qualified=?,qualification_reason=?,updated_at=? WHERE id=?`).bind(ok?1:0,ok?(side==='LONG'?'LONG_CONFIRMED':'SHORT_CONFIRMED'):failed.join('+'),new Date().toISOString(),r.id).run();updated++;
+  }
+  return{success:true,version:VERSION,module:'REPAIR_SIGNAL_QUALIFICATIONS',updated,qualified,rejected};
 }
 
 async function scoreDistribution(env:Env){
@@ -1356,6 +1403,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
     <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>
     <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
+    <button id="repair-qualification-btn" type="button">🔧 REPAIR QUALIFICATION</button>
     <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
   </div>
   <div id="signal-history-view" style="display:none">
@@ -1422,6 +1470,7 @@ document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Ca
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
 document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));
 document.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
+document.getElementById('repair-qualification-btn')?.addEventListener('click',()=>mpD1Call('/api/repair-qualification'));
 document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
@@ -1458,7 +1507,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1481,6 +1530,7 @@ export default {
       if (url.pathname === '/api/signal-history') return json(await signalHistory(env));
       if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));
       if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
+      if (url.pathname === '/api/repair-qualification') return json(await repairSignalQualifications(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
