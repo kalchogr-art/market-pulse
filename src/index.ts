@@ -1354,7 +1354,8 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
     <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
-    <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>\n    <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
+    <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>
+    <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
     <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
   </div>
   <div id="signal-history-view" style="display:none">
@@ -1419,7 +1420,8 @@ document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Cal
 document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
 document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
-document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));\ndocument.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
+document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));
+document.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
 document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
@@ -1477,7 +1479,8 @@ export default {
       if (url.pathname === '/api/paper-run') return json(await paperRun(env));
       if (url.pathname === '/api/paper-status') return json(await paperStatus(env));
       if (url.pathname === '/api/signal-history') return json(await signalHistory(env));
-      if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));\n      if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
+      if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));
+      if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
