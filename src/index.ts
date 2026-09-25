@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.8';
+const VERSION = '1.7.9';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -783,6 +783,15 @@ async function ensureSignalEventSchema(env:Env){
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   )`).run();
+  const signalCols=(await env.DB.prepare(`PRAGMA table_info(signal_events)`).all()).results??[];
+  const signalNames=new Set((signalCols as Obj[]).map((x:Obj)=>String(x.name)));
+  for(const [name,type] of [
+    ['qualified_at','TEXT'],['qualified_price','REAL'],['qualified_score','REAL'],
+    ['qualified_persistence_score','REAL'],['qualified_regime_streak','INTEGER'],
+    ['qualified_acceleration','REAL'],['paper_observation_id','TEXT']
+  ] as const){
+    if(!signalNames.has(name))await env.DB.prepare(`ALTER TABLE signal_events ADD COLUMN ${name} ${type}`).run();
+  }
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signal_events_time ON signal_events(start_time DESC)`).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_signal_events_epic_status ON signal_events(epic,status)`).run();
 }
@@ -809,9 +818,22 @@ async function trackSignalEvents(env:Env){
       const mae=Math.min(Number(open.max_adverse_pct??0),move);
       if(side===String(open.side)){
         const peak=String(open.side)==='LONG'?Math.max(Number(open.peak_score),score):Math.min(Number(open.peak_score),score);
+        let qualificationAction:Obj|null=null;
+        if(Number(open.qualified)!==1){
+          const pstate=await persistenceForEpic(env,item.epic);
+          const decision=qualifyEntry(snap,pstate);
+          if(decision.eligible && String(decision.side)===String(open.side)){
+            await env.DB.prepare(`UPDATE signal_events SET qualified=1,qualification_reason=?,qualified_at=?,qualified_price=?,qualified_score=?,qualified_persistence_score=?,qualified_regime_streak=?,qualified_acceleration=?,persistence_score=?,regime_streak=?,acceleration=?,updated_at=? WHERE id=?`)
+              .bind(String(decision.reason),String(snap.captured_at),price,score,number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),now,String(open.id)).run();
+            qualificationAction={qualified_now:true,qualified_at:String(snap.captured_at),reason:decision.reason};
+          }else{
+            await env.DB.prepare(`UPDATE signal_events SET qualification_reason=?,persistence_score=?,regime_streak=?,acceleration=?,updated_at=? WHERE id=?`)
+              .bind(String(decision.reason??''),number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),now,String(open.id)).run();
+          }
+        }
         await env.DB.prepare(`UPDATE signal_events SET last_above_time=?,last_price=?,last_score=?,peak_score=?,samples=samples+1,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
           .bind(String(snap.captured_at),price,score,peak,mfe,mae,now,String(open.id)).run();
-        actions.push({epic:item.epic,action:'TRACK',id:open.id});
+        actions.push({epic:item.epic,action:'TRACK',id:open.id,...(qualificationAction??{})});
         continue;
       }
       await env.DB.prepare(`UPDATE signal_events SET status='CLOSED',end_time=?,last_price=?,last_score=?,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
@@ -830,6 +852,10 @@ async function trackSignalEvents(env:Env){
         .bind(id,item.epic,side,'OPEN',String(snap.captured_at),String(snap.captured_at),price,price,score,score,score,1,
           0,0,qualified,String(decision.reason??''),number(pstate.persistence?.score),Number(pstate.regime_streak?.count??0),
           number(pstate.persistence?.acceleration),now,now).run();
+      if(qualified===1){
+        await env.DB.prepare(`UPDATE signal_events SET qualified_at=?,qualified_price=?,qualified_score=?,qualified_persistence_score=?,qualified_regime_streak=?,qualified_acceleration=? WHERE id=?`)
+          .bind(String(snap.captured_at),price,score,number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),id).run();
+      }
       actions.push({epic:item.epic,action:'OPEN',id,side,qualified:qualified===1,reason:decision.reason});
     }
   }
@@ -983,6 +1009,7 @@ async function ensurePaperSchema(env: Env) {
   ] as const){
     if(!paperObsNames.has(name))await env.DB.prepare(`ALTER TABLE paper_observations ADD COLUMN ${name} ${type}`).run();
   }
+  if(!paperObsNames.has('signal_event_id'))await env.DB.prepare(`ALTER TABLE paper_observations ADD COLUMN signal_event_id TEXT`).run();
   await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_paper_obs_epic_status ON paper_observations(epic,status)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS paper_matrix_trades (
     id TEXT PRIMARY KEY, observation_id TEXT NOT NULL, variant TEXT NOT NULL, epic TEXT NOT NULL,
@@ -1039,17 +1066,17 @@ async function entryVolatility(env:Env,epic:string,price:number){
   out.volatility_regime=basis===null?'UNKNOWN':basis<0.03?'LOW':basis<0.08?'NORMAL':basis<0.15?'HIGH':'EXTREME';
   return out;
 }
-async function openMatrixObservation(env:Env, epic:string, side:string, snap:Obj, p:Obj){
+async function openMatrixObservation(env:Env, epic:string, side:string, snap:Obj, p:Obj, signalEventId:string|null=null){
   const now=String(snap.captured_at??new Date().toISOString()), price=number(snap.price);
   if(price===null)return null;
   const oid=`${epic}|${now}|${side}`;
   const vol=await entryVolatility(env,epic,price);
   await env.DB.prepare(`INSERT OR IGNORE INTO paper_observations
-    (id,epic,side,status,entry_time,entry_price,entry_combined_score,entry_persistence_score,entry_regime,entry_regime_streak,entry_acceleration,
+    (id,epic,side,status,entry_time,entry_price,entry_combined_score,entry_persistence_score,entry_regime,entry_regime_streak,entry_acceleration,signal_event_id,
      entry_atr_1m,entry_atr_5m,entry_atr_30m,entry_atr_pct_1m,entry_atr_pct_5m,entry_atr_pct_30m,volatility_regime,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
       oid,epic,side,'OPEN',now,price,number(snap.combined_score),number(p.persistence?.score),
-      String(p.persistence?.bias??'NOT_READY'),Number(p.regime_streak?.count??0),number(p.persistence?.acceleration),
+      String(p.persistence?.bias??'NOT_READY'),Number(p.regime_streak?.count??0),number(p.persistence?.acceleration),signalEventId,
       vol.atr_1m,vol.atr_5m,vol.atr_30m,vol.atr_pct_1m,vol.atr_pct_5m,vol.atr_pct_30m,vol.volatility_regime,now,now).run();
   for(const v of PAPER_MATRIX){
     const id=`${oid}|${v.id}`;
@@ -1097,8 +1124,14 @@ async function paperRun(env:Env){
     }
     const p=await persistenceForEpic(env,epic), decision=paperEntryDecision(snap,p);
     if(decision.eligible){
-      const oid=await openMatrixObservation(env,epic,String(decision.side),snap,p);
-      actions.push({epic,action:'OPEN_MATRIX',observation_id:oid,side:decision.side,variants:PAPER_MATRIX.length,price});
+      const ev=await env.DB.prepare(`SELECT * FROM signal_events WHERE epic=? AND side=? AND status='OPEN' ORDER BY start_time DESC LIMIT 1`).bind(epic,String(decision.side)).first<Obj>();
+      const signalEventId=ev?String(ev.id):null;
+      const oid=await openMatrixObservation(env,epic,String(decision.side),snap,p,signalEventId);
+      if(signalEventId && oid){
+        await env.DB.prepare(`UPDATE signal_events SET qualified=1,qualification_reason=?,qualified_at=COALESCE(qualified_at,?),qualified_price=COALESCE(qualified_price,?),qualified_score=COALESCE(qualified_score,?),qualified_persistence_score=COALESCE(qualified_persistence_score,?),qualified_regime_streak=COALESCE(qualified_regime_streak,?),qualified_acceleration=COALESCE(qualified_acceleration,?),paper_observation_id=?,updated_at=? WHERE id=?`)
+          .bind(String(decision.reason),now,price,number(snap.combined_score),number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),oid,new Date().toISOString(),signalEventId).run();
+      }
+      actions.push({epic,action:'OPEN_MATRIX',observation_id:oid,signal_event_id:signalEventId,side:decision.side,variants:PAPER_MATRIX.length,price});
     }else actions.push({epic,action:'WAIT',reason:decision.reason,combined_score:number(snap.combined_score),persistence_score:number(p.persistence?.score),regime:p.persistence?.bias,streak:p.regime_streak?.count,acceleration:p.persistence?.acceleration});
   }
   return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
@@ -1366,7 +1399,11 @@ async function signalHistory(env:Env){
       persistence:number(x.persistence_score),
       streak:Number(x.regime_streak??0),
       acceleration:number(x.acceleration),
-      reason:x.qualified?null:(x.qualification_reason??null)
+      reason:x.qualified?null:(x.qualification_reason??null),
+      qualified_at:x.qualified_at??null,
+      qualified_price:number(x.qualified_price),
+      qualified_score:number(x.qualified_score),
+      paper_observation_id:x.paper_observation_id??null
     };
   });
 
