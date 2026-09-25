@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.7';
+const VERSION = '1.7.8';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1211,6 +1211,40 @@ async function repairSignalQualifications(env:Env){
   return{success:true,version:VERSION,module:'REPAIR_SIGNAL_QUALIFICATIONS',updated,qualified,rejected};
 }
 
+async function qualifiedMatrixGapDiagnostic(env:Env){
+  await ensureSignalEventSchema(env); await ensurePaperSchema(env);
+  const er=await env.DB.prepare(`SELECT id,epic,side,start_time,entry_price,entry_score,persistence_score,regime_streak,acceleration,qualified,qualification_reason FROM signal_events ORDER BY start_time DESC`).all();
+  const or=await env.DB.prepare(`SELECT id,epic,side,status,entry_time,entry_price,entry_combined_score FROM paper_observations ORDER BY entry_time DESC`).all();
+  const tr=await env.DB.prepare(`SELECT observation_id,COUNT(*) variants,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open_variants,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed_variants FROM paper_matrix_trades GROUP BY observation_id`).all();
+  const events=(er.results??[]) as Obj[], obs=(or.results??[]) as Obj[], trades=(tr.results??[]) as Obj[];
+  const tmap=new Map(trades.map(x=>[String(x.observation_id),x]));
+  const qualified=events.filter(x=>Number(x.qualified)===1);
+  const matched=new Set<string>(), rows:Obj[]=[];
+  const nearest=(e:Obj)=>{
+    let best:Obj|null=null,bestMs=Infinity;
+    for(const o of obs){
+      if(String(o.epic)!==String(e.epic)||String(o.side)!==String(e.side))continue;
+      const d=Math.abs(Date.parse(String(o.entry_time))-Date.parse(String(e.start_time)));
+      if(d<bestMs){bestMs=d;best=o;}
+    }
+    return best&&bestMs<=120000?{o:best,ms:bestMs}:null;
+  };
+  for(const e of qualified){
+    const m=nearest(e);
+    if(m){
+      matched.add(String(m.o.id)); const t=tmap.get(String(m.o.id));
+      rows.push({signal_id:e.id,time:e.start_time,asset:e.epic,side:e.side,score:e.entry_score,status:'MATCHED_OBSERVATION',observation_id:m.o.id,time_gap_seconds:round(m.ms/1000,1),observation_status:m.o.status,variants:Number(t?.variants??0),open_variants:Number(t?.open_variants??0),closed_variants:Number(t?.closed_variants??0)});
+    }else rows.push({signal_id:e.id,time:e.start_time,asset:e.epic,side:e.side,score:e.entry_score,status:'QUALIFIED_WITHOUT_OBSERVATION',reason:'NO_PAPER_OBSERVATION_WITHIN_120_SECONDS'});
+  }
+  const missing=rows.filter(x=>x.status==='QUALIFIED_WITHOUT_OBSERVATION');
+  const matchedRows=rows.filter(x=>x.status==='MATCHED_OBSERVATION');
+  const obsWithoutSix=obs.filter(o=>Number(tmap.get(String(o.id))?.variants??0)!==PAPER_MATRIX.length);
+  const byAsset:Obj={}; for(const r of rows){const k=String(r.asset);byAsset[k]??={qualified:0,matched:0,missing:0};byAsset[k].qualified++;if(r.status==='MATCHED_OBSERVATION')byAsset[k].matched++;else byAsset[k].missing++;}
+  return{success:true,worker:'market-pulse',version:VERSION,module:'QUALIFIED_TO_MATRIX_GAP_DIAGNOSTIC',window_seconds:120,
+    summary:{qualified_events:qualified.length,paper_observations:obs.length,matched_qualified:matchedRows.length,qualified_without_observation:missing.length,observations_with_wrong_variant_count:obsWithoutSix.length,expected_variants_per_observation:PAPER_MATRIX.length},
+    by_asset:byAsset,missing_qualified:missing,matched_qualified:matchedRows,observation_variant_issues:obsWithoutSix.slice(0,100)};
+}
+
 async function scoreDistribution(env:Env){
   await ensureSnapshotSchema(env);
   const rr=await env.DB.prepare(`SELECT captured_at,epic,combined_score FROM market_snapshots WHERE combined_score IS NOT NULL ORDER BY epic,captured_at`).all();
@@ -1404,6 +1438,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>
     <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
     <button id="repair-qualification-btn" type="button">🔧 REPAIR QUALIFICATION</button>
+    <button id="matrix-gap-btn" type="button">🔍 QUALIFIED → MATRIX</button>
     <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
   </div>
   <div id="signal-history-view" style="display:none">
@@ -1471,6 +1506,7 @@ document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1
 document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));
 document.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
 document.getElementById('repair-qualification-btn')?.addEventListener('click',()=>mpD1Call('/api/repair-qualification'));
+document.getElementById('matrix-gap-btn')?.addEventListener('click',()=>mpD1Call('/api/matrix-gap'));
 document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
@@ -1507,7 +1543,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1531,6 +1567,7 @@ export default {
       if (url.pathname === '/api/score-distribution') return json(await scoreDistribution(env));
       if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
       if (url.pathname === '/api/repair-qualification') return json(await repairSignalQualifications(env));
+      if (url.pathname === '/api/matrix-gap') return json(await qualifiedMatrixGapDiagnostic(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
