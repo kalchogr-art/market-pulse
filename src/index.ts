@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.9';
+const VERSION = '1.7.10';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1105,36 +1105,59 @@ async function updateMatrixTrade(env:Env,t:Obj,price:number,now:string){
   return false;
 }
 async function paperRun(env:Env){
-  await ensureSnapshotSchema(env);await ensurePaperSchema(env);
+  await ensureSnapshotSchema(env);await ensureSignalEventSchema(env);await ensurePaperSchema(env);
   const actions:Obj[]=[];
   for(const item of WATCHLIST){
     const epic=item.epic,snap=await latestSnapshotRow(env,epic);
     if(!snap){actions.push({epic,action:'SKIP',reason:'NO_SNAPSHOT'});continue;}
     const price=number(snap.price); if(price===null){actions.push({epic,action:'SKIP',reason:'NO_PRICE'});continue;}
     const now=String(snap.captured_at);
-    const openObs=await env.DB.prepare(`SELECT * FROM paper_observations WHERE epic=? AND status='OPEN' ORDER BY entry_time DESC LIMIT 1`).bind(epic).first<Obj>();
-    if(openObs){
+
+    // V1.7.10: every open research observation is tracked independently.
+    // Multiple observations for the same asset may coexist; this does NOT change future DEMO/LIVE position limits.
+    const openObsRows=await env.DB.prepare(`SELECT * FROM paper_observations WHERE epic=? AND status='OPEN' ORDER BY entry_time`).bind(epic).all();
+    let trackedObservations=0,closedVariantsNow=0,closedObservationsNow=0;
+    for(const openObs of (openObsRows.results??[]) as Obj[]){
       const trades=await env.DB.prepare(`SELECT * FROM paper_matrix_trades WHERE observation_id=? AND status='OPEN'`).bind(String(openObs.id)).all();
       let closed=0;
       for(const t of (trades.results??[]) as Obj[])if(await updateMatrixTrade(env,t,price,now))closed++;
       const left=await env.DB.prepare(`SELECT COUNT(*) c FROM paper_matrix_trades WHERE observation_id=? AND status='OPEN'`).bind(String(openObs.id)).first<Obj>();
-      if(Number(left?.c??0)===0)await env.DB.prepare(`UPDATE paper_observations SET status='CLOSED',updated_at=? WHERE id=?`).bind(now,String(openObs.id)).run();
-      actions.push({epic,action:'TRACK_MATRIX',observation_id:openObs.id,variants_open:Number(left?.c??0),variants_closed_now:closed});
-      continue;
-    }
-    const p=await persistenceForEpic(env,epic), decision=paperEntryDecision(snap,p);
-    if(decision.eligible){
-      const ev=await env.DB.prepare(`SELECT * FROM signal_events WHERE epic=? AND side=? AND status='OPEN' ORDER BY start_time DESC LIMIT 1`).bind(epic,String(decision.side)).first<Obj>();
-      const signalEventId=ev?String(ev.id):null;
-      const oid=await openMatrixObservation(env,epic,String(decision.side),snap,p,signalEventId);
-      if(signalEventId && oid){
-        await env.DB.prepare(`UPDATE signal_events SET qualified=1,qualification_reason=?,qualified_at=COALESCE(qualified_at,?),qualified_price=COALESCE(qualified_price,?),qualified_score=COALESCE(qualified_score,?),qualified_persistence_score=COALESCE(qualified_persistence_score,?),qualified_regime_streak=COALESCE(qualified_regime_streak,?),qualified_acceleration=COALESCE(qualified_acceleration,?),paper_observation_id=?,updated_at=? WHERE id=?`)
-          .bind(String(decision.reason),now,price,number(snap.combined_score),number(decision.persistence),Number(decision.streak??0),number(decision.acceleration),oid,new Date().toISOString(),signalEventId).run();
+      if(Number(left?.c??0)===0){
+        await env.DB.prepare(`UPDATE paper_observations SET status='CLOSED',updated_at=? WHERE id=?`).bind(now,String(openObs.id)).run();
+        closedObservationsNow++;
       }
-      actions.push({epic,action:'OPEN_MATRIX',observation_id:oid,signal_event_id:signalEventId,side:decision.side,variants:PAPER_MATRIX.length,price});
-    }else actions.push({epic,action:'WAIT',reason:decision.reason,combined_score:number(snap.combined_score),persistence_score:number(p.persistence?.score),regime:p.persistence?.bias,streak:p.regime_streak?.count,acceleration:p.persistence?.acceleration});
+      trackedObservations++;closedVariantsNow+=closed;
+    }
+
+    // One newly-qualified signal event = one independent A-F matrix observation.
+    // Exact qualified_at == current snapshot prevents historical/unlinked events from being opened late at the wrong price.
+    const newlyQualified=await env.DB.prepare(`SELECT * FROM signal_events
+      WHERE epic=? AND status='OPEN' AND qualified=1 AND paper_observation_id IS NULL AND qualified_at=?
+      ORDER BY start_time`).bind(epic,now).all();
+    let opened=0;
+    const openedIds:Obj[]=[];
+    for(const ev of (newlyQualified.results??[]) as Obj[]){
+      const side=String(ev.side);
+      const p=await persistenceForEpic(env,epic);
+      const oid=await openMatrixObservation(env,epic,side,snap,p,String(ev.id));
+      if(!oid)continue;
+      await env.DB.prepare(`UPDATE signal_events SET paper_observation_id=?,updated_at=? WHERE id=? AND paper_observation_id IS NULL`)
+        .bind(oid,new Date().toISOString(),String(ev.id)).run();
+      opened++;
+      openedIds.push({signal_event_id:ev.id,observation_id:oid,side,qualified_at:ev.qualified_at,qualified_score:ev.qualified_score});
+    }
+
+    if(opened>0){
+      actions.push({epic,action:'OPEN_QUALIFIED_MATRIX',opened,observations:openedIds,tracked_open_observations:trackedObservations,variants_closed_now:closedVariantsNow,observations_closed_now:closedObservationsNow});
+    }else if(trackedObservations>0){
+      actions.push({epic,action:'TRACK_MATRICES',open_observations_tracked:trackedObservations,variants_closed_now:closedVariantsNow,observations_closed_now:closedObservationsNow});
+    }else{
+      actions.push({epic,action:'WAIT',reason:'NO_NEW_QUALIFIED_SIGNAL'});
+    }
   }
-  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
+  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE_V1710_ONE_QUALIFIED_ONE_OBSERVATION',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,
+    research_rule:'ONE_QUALIFIED_SIGNAL_EVENT_EQUALS_ONE_INDEPENDENT_A_F_OBSERVATION',
+    live_strategy_changed:false,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
 }
 async function paperStatus(env:Env){
   await ensurePaperSchema(env);
