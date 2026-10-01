@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.10';
+const VERSION = '1.7.11';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1155,7 +1155,7 @@ async function paperRun(env:Env){
       actions.push({epic,action:'WAIT',reason:'NO_NEW_QUALIFIED_SIGNAL'});
     }
   }
-  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE_V1710_ONE_QUALIFIED_ONE_OBSERVATION',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,
+  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE_V1711_ONE_QUALIFIED_ONE_OBSERVATION',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,
     research_rule:'ONE_QUALIFIED_SIGNAL_EVENT_EQUALS_ONE_INDEPENDENT_A_F_OBSERVATION',
     live_strategy_changed:false,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
 }
@@ -1449,6 +1449,69 @@ async function signalHistory(env:Env){
   };
 }
 
+
+async function entryAnalysis(env:Env){
+  await ensureSignalEventSchema(env); await ensurePaperSchema(env);
+  const since='2026-09-29T00:00:00Z';
+  const er=await env.DB.prepare(`SELECT
+      s.id,s.epic,s.side,s.qualified_at,s.qualified_score,
+      s.qualified_persistence_score,s.qualified_regime_streak,s.qualified_acceleration,
+      s.paper_observation_id,
+      t.variant,t.status AS trade_status,t.pnl_pct,t.exit_reason,t.max_favorable_pct,t.max_adverse_pct
+    FROM signal_events s
+    JOIN paper_matrix_trades t ON t.observation_id=s.paper_observation_id
+    WHERE s.qualified=1 AND s.qualified_at>=? AND s.paper_observation_id IS NOT NULL
+    ORDER BY s.qualified_at`).bind(since).all();
+  const rows=(er.results??[]) as Obj[];
+  const abs=(v:any)=>Math.abs(Number(v??0));
+  const bucket=(v:number,cuts:number[],labels:string[])=>{
+    for(let i=0;i<cuts.length;i++) if(v<cuts[i]) return labels[i];
+    return labels[labels.length-1];
+  };
+  const groups:Record<string,Map<string,Obj>>={
+    score:new Map(),persistence:new Map(),streak:new Map(),acceleration:new Map(),asset:new Map(),side:new Map()
+  };
+  const add=(dim:string,key:string,r:Obj)=>{
+    const m=groups[dim],g=m.get(key)??{group:key,trades:0,closed:0,wins:0,losses:0,total_pnl_pct:0,mfe_sum:0,mae_sum:0};
+    g.trades++;
+    if(String(r.trade_status)==='CLOSED'){
+      g.closed++;
+      const p=Number(r.pnl_pct??0); g.total_pnl_pct+=p;
+      if(p>0)g.wins++;else g.losses++;
+      g.mfe_sum+=Number(r.max_favorable_pct??0);
+      g.mae_sum+=Number(r.max_adverse_pct??0);
+    }
+    m.set(key,g);
+  };
+  for(const r of rows){
+    if(String(r.variant)!=='D')continue;
+    add('score',bucket(abs(r.qualified_score),[52,55,60],['50–51.99','52–54.99','55–59.99','60+']),r);
+    add('persistence',bucket(abs(r.qualified_persistence_score),[40,45,50],['35–39.99','40–44.99','45–49.99','50+']),r);
+    add('streak',bucket(Number(r.qualified_regime_streak??0),[6,11,21],['3–5','6–10','11–20','21+']),r);
+    add('acceleration',bucket(abs(r.qualified_acceleration),[5,10],['3–4.99','5–9.99','10+']),r);
+    add('asset',String(r.epic),r); add('side',String(r.side),r);
+  }
+  const finish=(m:Map<string,Obj>)=>Array.from(m.values()).map(g=>({
+    group:g.group,trades:g.trades,closed:g.closed,wins:g.wins,losses:g.losses,
+    win_rate_pct:g.closed?round2(g.wins/g.closed*100):null,
+    avg_pnl_pct:g.closed?Math.round(g.total_pnl_pct/g.closed*10000)/10000:null,
+    total_pnl_pct:Math.round(g.total_pnl_pct*10000)/10000,
+    avg_mfe_pct:g.closed?Math.round(g.mfe_sum/g.closed*10000)/10000:null,
+    avg_mae_pct:g.closed?Math.round(g.mae_sum/g.closed*10000)/10000:null
+  }));
+  return{
+    success:true,worker:'market-pulse',version:VERSION,module:'ENTRY_FORMULA_RESEARCH_READ_ONLY',
+    strategy_changed:false,trading:'DISABLED',
+    reference_variant:'D',reference_tp_pct:0.30,reference_sl_pct:0.20,
+    sample_since:since,qualified_linked_events:new Set(rows.map(r=>String(r.id))).size,
+    note:'Descriptive research only. No threshold or execution rule is changed automatically.',
+    analysis:{
+      score:finish(groups.score),persistence:finish(groups.persistence),streak:finish(groups.streak),
+      acceleration:finish(groups.acceleration),asset:finish(groups.asset),side:finish(groups.side)
+    }
+  };
+}
+
 async function snapshotStatus(env: Env){
   await ensureSnapshotSchema(env);
   const total=await env.DB.prepare('SELECT COUNT(*) AS total, MIN(captured_at) AS first_snapshot, MAX(captured_at) AS last_snapshot FROM market_snapshots').first<Obj>();
@@ -1473,7 +1536,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.5 · SCORE DISTRIBUTION · SIGNAL HISTORY</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.11 · ENTRY FORMULA RESEARCH</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1489,17 +1552,9 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
   <h2>💾 D1 SNAPSHOT HISTORY</h2>
   <p class="muted">Research-only snapshots: EURUSD, GOLD, SILVER, Crude Oil and Brent · 1m / 5m / 30m.</p>
   <div class="actions">
-    <button id="run-snapshot-btn" type="button">💾 RUN SNAPSHOT</button>
-    <button id="snapshot-status-btn" type="button">📚 SNAPSHOT STATUS</button>
-    <button id="persistence-btn" type="button">📈 PERSISTENCE</button>
-    <button id="paper-run-btn" type="button">🧪 MATRIX RUN</button>
-    <button id="paper-status-btn" type="button">📊 MATRIX STATUS</button>
+    <button id="snapshot-status-btn" type="button">⚙️ STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
-    <button id="score-distribution-btn" type="button">📊 SCORE DISTRIBUTION</button>
-    <button id="filter-diagnostic-btn" type="button">🧪 FILTER DIAGNOSTIC</button>
-    <button id="repair-qualification-btn" type="button">🔧 REPAIR QUALIFICATION</button>
-    <button id="matrix-gap-btn" type="button">🔍 QUALIFIED → MATRIX</button>
-    <button id="signal-backfill-btn" type="button">↩️ BACKFILL HISTORY</button>
+    <button id="entry-analysis-btn" type="button">🧠 ENTRY ANALYSIS</button>
   </div>
   <div id="signal-history-view" style="display:none">
     <div class="sig-summary" id="signal-summary"></div>
@@ -1557,17 +1612,9 @@ function renderSignalHistory(data){
   }
   rows.innerHTML=rh+'</tbody></table></div>';list.appendChild(rows);
 }
-document.getElementById('run-snapshot-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-run'));
 document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-status'));
-document.getElementById('persistence-btn')?.addEventListener('click',()=>mpD1Call('/api/persistence'));
-document.getElementById('paper-run-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-run'));
-document.getElementById('paper-status-btn')?.addEventListener('click',()=>mpD1Call('/api/paper-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
-document.getElementById('score-distribution-btn')?.addEventListener('click',()=>mpD1Call('/api/score-distribution'));
-document.getElementById('filter-diagnostic-btn')?.addEventListener('click',()=>mpD1Call('/api/filter-diagnostic'));
-document.getElementById('repair-qualification-btn')?.addEventListener('click',()=>mpD1Call('/api/repair-qualification'));
-document.getElementById('matrix-gap-btn')?.addEventListener('click',()=>mpD1Call('/api/matrix-gap'));
-document.getElementById('signal-backfill-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history-backfill'));
+document.getElementById('entry-analysis-btn')?.addEventListener('click',()=>mpD1Call('/api/entry-analysis'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1603,7 +1650,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/entry-analysis', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1628,6 +1675,7 @@ export default {
       if (url.pathname === '/api/filter-diagnostic') return json(await entryFilterDiagnostic(env));
       if (url.pathname === '/api/repair-qualification') return json(await repairSignalQualifications(env));
       if (url.pathname === '/api/matrix-gap') return json(await qualifiedMatrixGapDiagnostic(env));
+      if (url.pathname === '/api/entry-analysis') return json(await entryAnalysis(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
