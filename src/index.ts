@@ -8,7 +8,8 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.18';
+const VERSION = '1.7.19';
+const NEW_SIGNALS_SINCE = '2026-10-02T00:00:00Z'; // forward-only exact-target research cohort
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1404,7 +1405,7 @@ async function signalHistory(env:Env){
   await ensureSignalEventSchema(env);
   await ensurePaperSchema(env);
 
-  const er=await env.DB.prepare(`SELECT * FROM signal_events ORDER BY start_time DESC LIMIT 100`).all();
+  const er=await env.DB.prepare(`SELECT * FROM signal_events WHERE COALESCE(qualified_at,start_time)>=? ORDER BY start_time DESC LIMIT 100`).bind(NEW_SIGNALS_SINCE).all();
   const events=(er.results??[]) as Obj[];
 
   const mr=await env.DB.prepare(`SELECT variant,tp_pct,sl_pct,
@@ -1414,8 +1415,9 @@ async function signalHistory(env:Env){
     SUM(CASE WHEN status='CLOSED' AND pnl_pct<=0 THEN 1 ELSE 0 END) losses,
     ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) avg_pnl_pct,
     ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_pct ELSE 0 END),4) total_pnl_pct
-    FROM paper_matrix_trades
-    GROUP BY variant,tp_pct,sl_pct ORDER BY variant`).all();
+    FROM paper_matrix_trades t JOIN paper_observations o ON o.id=t.observation_id
+    WHERE o.entry_time>=?
+    GROUP BY variant,tp_pct,sl_pct ORDER BY variant`).bind(NEW_SIGNALS_SINCE).all();
 
   const matrix=((mr.results??[]) as Obj[]).map(x=>{
     const closed=Number(x.closed??0),wins=Number(x.wins??0);
@@ -1465,6 +1467,8 @@ async function signalHistory(env:Env){
   return{
     success:true,
     version:VERSION,
+    cohort:'NEW_SIGNALS_ONLY',
+    new_signals_since:NEW_SIGNALS_SINCE,
     signal_history:{
       signals:rows.length,
       open:rows.filter(x=>x.status==='OPEN').length,
@@ -1482,7 +1486,7 @@ async function signalHistory(env:Env){
 
 async function matrixExitAudit(env:Env){
   await ensurePaperSchema(env);
-  const since='2026-09-29T00:00:00Z';
+  const since=NEW_SIGNALS_SINCE;
   const q=await env.DB.prepare(`SELECT
     t.observation_id,t.variant,t.tp_pct,t.sl_pct,t.status,t.exit_reason,t.entry_price,t.exit_price,
     t.entry_time,t.exit_time,t.pnl_pct,t.max_favorable_pct,t.max_adverse_pct,
@@ -1538,7 +1542,7 @@ async function matrixExitAudit(env:Env){
     avg_duration_min:g.trades?Math.round(g.duration_sum_min/g.trades*100)/100:null
   })).sort((a:any,b:any)=>String(a.variant).localeCompare(String(b.variant)));
   return{success:true,worker:'market-pulse',version:VERSION,module:'MATRIX_EXIT_AUDIT_READ_ONLY',
-    strategy_changed:false,trading:'DISABLED',sample_since:since,closed_trade_rows:rows.length,
+    strategy_changed:false,trading:'DISABLED',cohort:'NEW_SIGNALS_ONLY',new_signals_since:NEW_SIGNALS_SINCE,sample_since:since,closed_trade_rows:rows.length,
     exact_exit_reason_counts:reasonCounts,by_variant:variants,recent_samples:samples,
     note:'Audit only: exact stored exit reasons, recorded vs recomputed P/L, duration and TP/SL overshoot where the stored reason can be classified.'};
 }
@@ -1546,7 +1550,7 @@ async function matrixExitAudit(env:Env){
 
 async function entryPathReplay(env:Env){
   await ensureSnapshotSchema(env); await ensureSignalEventSchema(env);
-  const since='2026-09-29T00:00:00Z';
+  const since=NEW_SIGNALS_SINCE;
   const horizons=[5,10,15,20,30,45,60];
   const er=await env.DB.prepare(`SELECT id,epic,side,qualified_at,qualified_price,qualified_score,
     qualified_persistence_score,qualified_regime_streak,qualified_acceleration
@@ -1601,7 +1605,7 @@ async function entryPathReplay(env:Env){
   const accelGroups=[bucket('ACCEL_3_TO_LT10',r=>Math.abs(Number(r.acceleration??0))>=3&&Math.abs(Number(r.acceleration??0))<10),
     bucket('ACCEL_10_PLUS',r=>Math.abs(Number(r.acceleration??0))>=10)];
   return{success:true,worker:'market-pulse',version:VERSION,module:'ENTRY_PATH_REPLAY_READ_ONLY',strategy_changed:false,trading:'DISABLED',
-    source:'market_snapshots + exact qualification entry',sample_since:since,horizons_minutes:horizons,qualified_events:events.length,replayed_events:rows.length,
+    source:'market_snapshots + exact qualification entry',cohort:'NEW_SIGNALS_ONLY',new_signals_since:NEW_SIGNALS_SINCE,sample_since:since,horizons_minutes:horizons,qualified_events:events.length,replayed_events:rows.length,
     summary_by_horizon:summary,acceleration_30m:accelGroups,events:rows,
     note:'Research only. Old Matrix exit P/L is not used. Replay measures observed snapshot path after exact qualification entry.'};
 }
@@ -1609,7 +1613,7 @@ async function entryPathReplay(env:Env){
 
 async function tpSlPathReplay(env:Env){
   await ensureSnapshotSchema(env); await ensureSignalEventSchema(env);
-  const since='2026-09-29T00:00:00Z';
+  const since=NEW_SIGNALS_SINCE;
   const tpLevels=[0.15,0.20,0.30,0.40,0.50], slLevels=[0.10,0.15,0.20,0.30,0.40], horizons=[30,45,60];
   const er=await env.DB.prepare(`SELECT id,epic,side,qualified_at,qualified_price,qualified_score,
     qualified_persistence_score,qualified_regime_streak,qualified_acceleration
@@ -1676,16 +1680,62 @@ async function tpSlPathReplay(env:Env){
       avg_first_touch_min:touched?round4(minutes/touched):null};
   };
   return{success:true,worker:'market-pulse',version:VERSION,module:'TP_SL_PATH_REPLAY_READ_ONLY',strategy_changed:false,trading:'DISABLED',
-    source:'market_snapshots + exact qualification entry',sample_since:since,filter:'ABS_ACCELERATION >= 3 AND < 10',
+    source:'market_snapshots + exact qualification entry',cohort:'NEW_SIGNALS_ONLY',new_signals_since:NEW_SIGNALS_SINCE,sample_since:since,filter:'ABS_ACCELERATION >= 3 AND < 10',
     qualified_events:allEvents.length,filtered_events:events.length,replayed_events:replayed.length,horizons_minutes:horizons,
     tp_levels:tpLevels.map(x=>levelTouches(x,'TP')),sl_levels:slLevels.map(x=>levelTouches(x,'SL')),matrix_by_horizon:matrices,
     methodology:{first_touch:'Earliest observed market_snapshot crossing wins.',tp_sl_fill:'Exact configured threshold is used for TP/SL P/L after a crossing is observed.',neither:'If neither threshold is observed by the horizon, P/L uses the nearest snapshot to that horizon.',intraminute_limit:'Snapshot data cannot prove unseen intraminute path or ordering between snapshots.'},
     note:'Research only. No entry, paper, DEMO or LIVE trading rule is changed.'};
 }
 
+async function researchLab(env:Env, params:URLSearchParams){
+  await ensureSnapshotSchema(env); await ensureSignalEventSchema(env);
+  const epic=(params.get('epic')??'ALL').toUpperCase();
+  const side=(params.get('side')??'ALL').toUpperCase();
+  const scoreMin=Math.max(0,Number(params.get('score_min')??50));
+  const persistenceMin=Math.max(0,Number(params.get('persistence_min')??35));
+  const streakMin=Math.max(0,Number(params.get('streak_min')??3));
+  const accelMin=Math.max(0,Number(params.get('accel_min')??3));
+  const accelMax=Math.max(accelMin,Number(params.get('accel_max')??10));
+  const tp=Math.max(0.01,Number(params.get('tp')??0.50));
+  const sl=Math.max(0.01,Number(params.get('sl')??0.30));
+  const horizon=Math.min(120,Math.max(1,Number(params.get('horizon')??30)));
+  const er=await env.DB.prepare(`SELECT id,epic,side,qualified_at,qualified_price,qualified_score,
+    qualified_persistence_score,qualified_regime_streak,qualified_acceleration
+    FROM signal_events WHERE qualified=1 AND qualified_at>=? AND qualified_price IS NOT NULL ORDER BY qualified_at`)
+    .bind(NEW_SIGNALS_SINCE).all();
+  const abs=(v:any)=>Math.abs(Number(v??0));
+  const events=((er.results??[]) as Obj[]).filter(e=>(epic==='ALL'||String(e.epic).toUpperCase()===epic)&&
+    (side==='ALL'||String(e.side).toUpperCase()===side)&&abs(e.qualified_score)>=scoreMin&&abs(e.qualified_persistence_score)>=persistenceMin&&
+    Number(e.qualified_regime_streak??0)>=streakMin&&abs(e.qualified_acceleration)>=accelMin&&abs(e.qualified_acceleration)<accelMax);
+  const move=(sd:string,en:number,px:number)=>sd==='SHORT'?(en-px)/en*100:(px-en)/en*100;
+  let tpFirst=0,slFirst=0,timeExit=0,total=0,tpMin=0,slMin=0; const rows:Obj[]=[];
+  for(const e of events){
+    const start=Date.parse(String(e.qualified_at)); if(!Number.isFinite(start))continue;
+    const end=new Date(start+horizon*60000+120000).toISOString();
+    const sr=await env.DB.prepare(`SELECT captured_at,price FROM market_snapshots WHERE epic=? AND captured_at>=? AND captured_at<=? AND price IS NOT NULL ORDER BY captured_at`)
+      .bind(String(e.epic),String(e.qualified_at),end).all();
+    const entry=Number(e.qualified_price),sd=String(e.side);
+    const path=((sr.results??[]) as Obj[]).map(x=>({time:String(x.captured_at),ms:Date.parse(String(x.captured_at)),price:Number(x.price)}))
+      .filter(x=>Number.isFinite(x.ms)&&Number.isFinite(x.price)).map(x=>({...x,m:move(sd,entry,x.price)}));
+    if(!path.length)continue;
+    const limit=start+horizon*60000; let hit:any=null;
+    for(const x of path.filter(x=>x.ms<=limit+90000)){if(x.m>=tp){hit={kind:'TP',x};break;}if(x.m<=-sl){hit={kind:'SL',x};break;}}
+    let kind='TIME',pnl=0,mins=horizon;
+    if(hit){kind=hit.kind;mins=(hit.x.ms-start)/60000;pnl=kind==='TP'?tp:-sl;if(kind==='TP'){tpFirst++;tpMin+=mins}else{slFirst++;slMin+=mins}}
+    else {timeExit++;const candidates=path.filter(x=>Math.abs(x.ms-limit)<=120000);if(candidates.length){const n=candidates.reduce((a:any,b:any)=>Math.abs(b.ms-limit)<Math.abs(a.ms-limit)?b:a);pnl=n.m;}}
+    total+=pnl; rows.push({id:e.id,asset:e.epic,side:e.side,qualified_at:e.qualified_at,score:e.qualified_score,persistence:e.qualified_persistence_score,streak:e.qualified_regime_streak,acceleration:e.qualified_acceleration,result:kind,pnl_pct:round4(pnl),minutes:round4(mins)});
+  }
+  const n=rows.length;
+  return{success:true,worker:'market-pulse',version:VERSION,module:'D1_RESEARCH_LAB',strategy_changed:false,trading:'DISABLED',cohort:'NEW_SIGNALS_ONLY',new_signals_since:NEW_SIGNALS_SINCE,
+    filters:{epic,side,score_min:scoreMin,persistence_min:persistenceMin,streak_min:streakMin,accel_min:accelMin,accel_max_exclusive:accelMax,tp_pct:tp,sl_pct:sl,horizon_minutes:horizon},
+    results:{signals:n,tp_first:tpFirst,sl_first:slFirst,time_exit:timeExit,tp_rate_pct:n?round4(tpFirst/n*100):null,sl_rate_pct:n?round4(slFirst/n*100):null,
+      avg_pnl_pct:n?round4(total/n):null,total_pnl_pct:round4(total),avg_minutes_to_tp:tpFirst?round4(tpMin/tpFirst):null,avg_minutes_to_sl:slFirst?round4(slMin/slFirst):null},rows,
+    methodology:{first_touch:'Earliest observed market_snapshot crossing wins.',tp_sl_fill:'Exact configured TP/SL threshold.',time_exit:'Nearest observed snapshot to selected horizon.',intraminute_limit:'Unseen intraminute ordering cannot be proven from periodic snapshots.'}};
+}
+
 async function entryAnalysis(env:Env){
   await ensureSignalEventSchema(env); await ensurePaperSchema(env);
-  const since='2026-09-29T00:00:00Z';
+  const since=NEW_SIGNALS_SINCE;
   const er=await env.DB.prepare(`SELECT s.id,s.epic,s.side,s.qualified_at,s.qualified_score,s.qualified_persistence_score,
     s.qualified_regime_streak,s.qualified_acceleration,s.paper_observation_id,t.variant,t.tp_pct,t.sl_pct,
     t.status AS trade_status,t.pnl_pct,t.exit_reason,t.max_favorable_pct,t.max_adverse_pct
@@ -1720,7 +1770,7 @@ async function entryAnalysis(env:Env){
   const ranked=shadow_matrix.flatMap(x=>x.matrix.map((m:any)=>({shadow_id:x.id,shadow_label:x.label,events:x.events,...m})))
     .filter((x:any)=>x.closed>=5).sort((x:any,y:any)=>Number(y.avg_pnl_pct??-999)-Number(x.avg_pnl_pct??-999));
   return{success:true,worker:'market-pulse',version:VERSION,module:'SHADOW_ENTRY_X_TPSL_MATRIX_READ_ONLY',strategy_changed:false,trading:'DISABLED',
-    sample_since:since,qualified_linked_events:d.length,matrix_variants:{A:'TP .15 / SL .10',B:'TP .20 / SL .15',C:'TP .25 / SL .15',D:'TP .30 / SL .20',E:'TP .35 / SL .25',F:'TP .50 / SL .30'},
+    cohort:'NEW_SIGNALS_ONLY',new_signals_since:NEW_SIGNALS_SINCE,sample_since:since,qualified_linked_events:d.length,matrix_variants:{A:'TP .15 / SL .10',B:'TP .20 / SL .15',C:'TP .25 / SL .15',D:'TP .30 / SL .20',E:'TP .35 / SL .25',F:'TP .50 / SL .30'},
     important:'Same linked events, shadow entry filters crossed with existing A-F paper outcomes. No execution rule is changed.',
     shadow_matrix,research_ranking_min_5_samples:ranked.slice(0,20),
     caution:'Descriptive research only. Small samples can be unstable; no automatic winner is selected.'};
@@ -1750,7 +1800,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.18 · TP/SL PATH REPLAY</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.19 · D1 RESEARCH LAB · NEW SIGNALS ONLY</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1767,12 +1817,26 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
   <p class="muted">Research-only snapshots: EURUSD, GOLD, SILVER, Crude Oil and Brent · 1m / 5m / 30m.</p>
   <div class="actions">
     <button id="snapshot-status-btn" type="button">⚙️ STATUS</button>
-    <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
-    <button id="entry-analysis-btn" type="button">🧠 SHADOW MATRIX</button>
-    <button id="matrix-exit-audit-btn" type="button">🔬 EXIT AUDIT</button>
-    <button id="entry-path-replay-btn" type="button">🧭 ENTRY PATH</button>
-    <button id="tpsl-path-replay-btn" type="button">🎯 TP/SL PATH</button>
+    <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY · NEW</button>
+    <button id="entry-analysis-btn" type="button">🧠 SHADOW MATRIX · NEW</button>
+    <button id="matrix-exit-audit-btn" type="button">🔬 EXIT AUDIT · NEW</button>
+    <button id="entry-path-replay-btn" type="button">🧭 ENTRY PATH · NEW</button>
+    <button id="tpsl-path-replay-btn" type="button">🎯 TP/SL PATH · NEW</button>
   </div>
+
+  <div class="sig-card" style="margin-top:14px"><b>🧪 D1 RESEARCH LAB · NEW SIGNALS ONLY</b><div class="bar" style="margin-top:10px">
+    <select id="lab-epic"><option>ALL</option><option>EURUSD</option><option>GOLD</option><option>SILVER</option><option>OIL_CRUDE</option><option>OIL_BRENT</option></select>
+    <select id="lab-side"><option>ALL</option><option>LONG</option><option>SHORT</option></select>
+    <input id="lab-score" type="number" value="50" step="1" title="Score min">
+    <input id="lab-pers" type="number" value="35" step="1" title="Persistence min">
+    <input id="lab-streak" type="number" value="3" step="1" title="Streak min">
+    <input id="lab-amin" type="number" value="3" step="0.1" title="Acceleration min">
+    <input id="lab-amax" type="number" value="10" step="0.1" title="Acceleration max exclusive">
+    <input id="lab-tp" type="number" value="0.50" step="0.05" title="TP %">
+    <input id="lab-sl" type="number" value="0.30" step="0.05" title="SL %">
+    <select id="lab-horizon"><option value="5">5m</option><option value="10">10m</option><option value="15">15m</option><option value="20">20m</option><option value="30" selected>30m</option><option value="45">45m</option><option value="60">60m</option></select>
+    <button id="research-lab-btn" type="button">🧪 RUN RESEARCH</button>
+  </div><small>Score · Persistence · Streak · Accel min/max · TP · SL · Horizon. Чете D1 без deploy.</small></div>
   <div id="signal-history-view" style="display:none">
     <div class="sig-summary" id="signal-summary"></div>
     <div id="signal-list"></div>
@@ -1835,6 +1899,8 @@ document.getElementById('entry-analysis-btn')?.addEventListener('click',()=>mpD1
 document.getElementById('matrix-exit-audit-btn')?.addEventListener('click',()=>mpD1Call('/api/matrix-exit-audit'));
 document.getElementById('entry-path-replay-btn')?.addEventListener('click',()=>mpD1Call('/api/entry-path-replay'));
 document.getElementById('tpsl-path-replay-btn')?.addEventListener('click',()=>mpD1Call('/api/tpsl-path-replay'));
+document.getElementById('research-lab-btn')?.addEventListener('click',()=>{const v=(id)=>String(document.getElementById(id)?.value??'');const q=new URLSearchParams({epic:v('lab-epic'),side:v('lab-side'),score_min:v('lab-score'),persistence_min:v('lab-pers'),streak_min:v('lab-streak'),accel_min:v('lab-amin'),accel_max:v('lab-amax'),tp:v('lab-tp'),sl:v('lab-sl'),horizon:v('lab-horizon')});mpD1Call('/api/research-lab?'+q.toString());});
+
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1899,6 +1965,7 @@ export default {
       if (url.pathname === '/api/matrix-exit-audit') return json(await matrixExitAudit(env));
       if (url.pathname === '/api/entry-path-replay') return json(await entryPathReplay(env));
       if (url.pathname === '/api/tpsl-path-replay') return json(await tpSlPathReplay(env));
+      if (url.pathname === '/api/research-lab') return json(await researchLab(env,url.searchParams));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
