@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.14';
+const VERSION = '1.7.15';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1086,18 +1086,47 @@ async function openMatrixObservation(env:Env, epic:string, side:string, snap:Obj
   }
   return oid;
 }
+function exactTargetExitPrice(side:string,entry:number,targetPct:number,reason:string){
+  if(!Number.isFinite(entry)||entry<=0||!Number.isFinite(targetPct)||targetPct<0)return entry;
+  const k=targetPct/100;
+  if(reason==='TAKE_PROFIT')return side==='SHORT'?entry*(1-k):entry*(1+k);
+  if(reason==='STOP_LOSS')return side==='SHORT'?entry*(1+k):entry*(1-k);
+  return entry;
+}
 async function updateMatrixTrade(env:Env,t:Obj,price:number,now:string){
-  const move=paperMovePct(String(t.side),Number(t.entry_price),price);
-  const fav=Math.max(number(t.max_favorable_pct)??0,move), adv=Math.min(number(t.max_adverse_pct)??0,move);
+  const side=String(t.side), entry=Number(t.entry_price);
+  const observedMove=paperMovePct(side,entry,price);
+
+  // Keep real observed excursion for research/audit, even when the normalized
+  // paper exit is booked exactly at the configured TP/SL target.
+  const fav=Math.max(number(t.max_favorable_pct)??0,observedMove);
+  const adv=Math.min(number(t.max_adverse_pct)??0,observedMove);
   const age=(Date.parse(now)-Date.parse(String(t.entry_time)))/60000;
+  const tp=Math.abs(Number(t.tp_pct));
+  const sl=Math.abs(Number(t.sl_pct));
+
   let reason:string|null=null;
-  if(move>=Number(t.tp_pct))reason='TAKE_PROFIT';
-  else if(move<=-Number(t.sl_pct))reason='STOP_LOSS';
+  if(observedMove>=tp)reason='TAKE_PROFIT';
+  else if(observedMove<=-sl)reason='STOP_LOSS';
   else if(age>=Number(t.max_hold_minutes))reason='MAX_HOLD';
+
   if(reason){
-    const pnl=PAPER_CFG.notional*(move/100);
+    // V1.7.15 research normalization:
+    // TP/SL are booked at the configured target, not at the next periodic
+    // snapshot that happened to detect the crossing. This removes sampling
+    // overshoot from A-F comparisons. MAX_HOLD still uses observed market price.
+    let exitPrice=price;
+    let bookedMove=observedMove;
+    if(reason==='TAKE_PROFIT'){
+      bookedMove=tp;
+      exitPrice=exactTargetExitPrice(side,entry,tp,reason);
+    }else if(reason==='STOP_LOSS'){
+      bookedMove=-sl;
+      exitPrice=exactTargetExitPrice(side,entry,sl,reason);
+    }
+    const pnl=PAPER_CFG.notional*(bookedMove/100);
     await env.DB.prepare(`UPDATE paper_matrix_trades SET status='CLOSED',exit_time=?,exit_price=?,exit_reason=?,pnl_pct=?,pnl_value=?,max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
-      .bind(now,price,reason,move,pnl,fav,adv,now,String(t.id)).run();
+      .bind(now,exitPrice,reason,bookedMove,pnl,fav,adv,now,String(t.id)).run();
     return true;
   }
   await env.DB.prepare(`UPDATE paper_matrix_trades SET max_favorable_pct=?,max_adverse_pct=?,updated_at=? WHERE id=?`)
@@ -1580,7 +1609,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.14 · MATRIX EXIT AUDIT</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.15 · MATRIX EXIT AUDIT</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
