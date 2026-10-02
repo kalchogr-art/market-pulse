@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.17';
+const VERSION = '1.7.18';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1606,6 +1606,83 @@ async function entryPathReplay(env:Env){
     note:'Research only. Old Matrix exit P/L is not used. Replay measures observed snapshot path after exact qualification entry.'};
 }
 
+
+async function tpSlPathReplay(env:Env){
+  await ensureSnapshotSchema(env); await ensureSignalEventSchema(env);
+  const since='2026-09-29T00:00:00Z';
+  const tpLevels=[0.15,0.20,0.30,0.40,0.50], slLevels=[0.10,0.15,0.20,0.30,0.40], horizons=[30,45,60];
+  const er=await env.DB.prepare(`SELECT id,epic,side,qualified_at,qualified_price,qualified_score,
+    qualified_persistence_score,qualified_regime_streak,qualified_acceleration
+    FROM signal_events
+    WHERE qualified=1 AND qualified_at>=? AND qualified_at IS NOT NULL AND qualified_price IS NOT NULL
+    ORDER BY qualified_at`).bind(since).all();
+  const allEvents=(er.results??[]) as Obj[];
+  const events=allEvents.filter(e=>{const a=Math.abs(Number(e.qualified_acceleration??0));return a>=3&&a<10;});
+  const move=(side:string,entry:number,price:number)=>side==='SHORT'?(entry-price)/entry*100:(price-entry)/entry*100;
+  const replayed:Obj[]=[];
+  for(const e of events){
+    const start=Date.parse(String(e.qualified_at)); if(!Number.isFinite(start))continue;
+    const end=new Date(start+60*60000).toISOString();
+    const sr=await env.DB.prepare(`SELECT captured_at,price FROM market_snapshots
+      WHERE epic=? AND captured_at>=? AND captured_at<=? AND price IS NOT NULL ORDER BY captured_at`)
+      .bind(String(e.epic),String(e.qualified_at),end).all();
+    const entry=Number(e.qualified_price),side=String(e.side);
+    const path=((sr.results??[]) as Obj[]).map(x=>({time:String(x.captured_at),ms:Date.parse(String(x.captured_at)),price:Number(x.price)}))
+      .filter(x=>Number.isFinite(x.ms)&&Number.isFinite(x.price)).map(x=>({...x,move_pct:move(side,entry,x.price)}));
+    if(!path.length)continue;
+    replayed.push({event:e,start,entry,side,path});
+  }
+  const matrices:Obj={};
+  for(const horizon of horizons){
+    const combos:Obj[]=[];
+    for(const tp of tpLevels)for(const sl of slLevels){
+      let tpFirst=0,slFirst=0,neither=0,totalPnl=0,tpMinutes=0,slMinutes=0;
+      const byAsset:Record<string,Obj>={};
+      for(const r of replayed){
+        const limit=r.start+horizon*60000;
+        const p=r.path.filter((x:any)=>x.ms<=limit+90000);
+        let hit:any=null;
+        for(const x of p){
+          if(x.move_pct>=tp){hit={kind:'TP',x};break;}
+          if(x.move_pct<=-sl){hit={kind:'SL',x};break;}
+        }
+        let pnl=0,kind='NEITHER',mins:number|null=null;
+        if(hit){kind=hit.kind;mins=(hit.x.ms-r.start)/60000;pnl=kind==='TP'?tp:-sl;
+          if(kind==='TP'){tpFirst++;tpMinutes+=mins;}else{slFirst++;slMinutes+=mins;}
+        }else{
+          neither++;
+          const target=r.start+horizon*60000;
+          const candidates=p.filter((x:any)=>Math.abs(x.ms-target)<=120000);
+          if(candidates.length){const n=candidates.reduce((a:any,b:any)=>Math.abs(b.ms-target)<Math.abs(a.ms-target)?b:a);pnl=n.move_pct;}
+        }
+        totalPnl+=pnl;
+        const a=String(r.event.epic),g=byAsset[a]??(byAsset[a]={asset:a,signals:0,tp_first:0,sl_first:0,neither:0,total_pnl_pct:0});
+        g.signals++; if(kind==='TP')g.tp_first++;else if(kind==='SL')g.sl_first++;else g.neither++;g.total_pnl_pct+=pnl;
+      }
+      const n=replayed.length;
+      combos.push({tp_pct:tp,sl_pct:sl,signals:n,tp_first:tpFirst,sl_first:slFirst,neither,
+        tp_first_pct:n?round4(tpFirst/n*100):null,sl_first_pct:n?round4(slFirst/n*100):null,
+        avg_pnl_pct:n?round4(totalPnl/n):null,total_pnl_pct:round4(totalPnl),
+        avg_minutes_to_tp:tpFirst?round4(tpMinutes/tpFirst):null,avg_minutes_to_sl:slFirst?round4(slMinutes/slFirst):null,
+        by_asset:Object.values(byAsset).map((g:any)=>({...g,total_pnl_pct:round4(g.total_pnl_pct),avg_pnl_pct:g.signals?round4(g.total_pnl_pct/g.signals):null}))});
+    }
+    matrices[`${horizon}m`]=combos;
+  }
+  const levelTouches=(level:number,kind:'TP'|'SL')=>{
+    let touched=0,minutes=0;
+    for(const r of replayed){let hit:any=null;for(const x of r.path){if(kind==='TP'?x.move_pct>=level:x.move_pct<=-level){hit=x;break;}}
+      if(hit){touched++;minutes+=(hit.ms-r.start)/60000;}}
+    return{level_pct:level,touched,signals:replayed.length,touch_rate_pct:replayed.length?round4(touched/replayed.length*100):null,
+      avg_first_touch_min:touched?round4(minutes/touched):null};
+  };
+  return{success:true,worker:'market-pulse',version:VERSION,module:'TP_SL_PATH_REPLAY_READ_ONLY',strategy_changed:false,trading:'DISABLED',
+    source:'market_snapshots + exact qualification entry',sample_since:since,filter:'ABS_ACCELERATION >= 3 AND < 10',
+    qualified_events:allEvents.length,filtered_events:events.length,replayed_events:replayed.length,horizons_minutes:horizons,
+    tp_levels:tpLevels.map(x=>levelTouches(x,'TP')),sl_levels:slLevels.map(x=>levelTouches(x,'SL')),matrix_by_horizon:matrices,
+    methodology:{first_touch:'Earliest observed market_snapshot crossing wins.',tp_sl_fill:'Exact configured threshold is used for TP/SL P/L after a crossing is observed.',neither:'If neither threshold is observed by the horizon, P/L uses the nearest snapshot to that horizon.',intraminute_limit:'Snapshot data cannot prove unseen intraminute path or ordering between snapshots.'},
+    note:'Research only. No entry, paper, DEMO or LIVE trading rule is changed.'};
+}
+
 async function entryAnalysis(env:Env){
   await ensureSignalEventSchema(env); await ensurePaperSchema(env);
   const since='2026-09-29T00:00:00Z';
@@ -1673,7 +1750,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.17 · ENTRY PATH REPLAY</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.18 · TP/SL PATH REPLAY</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1694,6 +1771,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="entry-analysis-btn" type="button">🧠 SHADOW MATRIX</button>
     <button id="matrix-exit-audit-btn" type="button">🔬 EXIT AUDIT</button>
     <button id="entry-path-replay-btn" type="button">🧭 ENTRY PATH</button>
+    <button id="tpsl-path-replay-btn" type="button">🎯 TP/SL PATH</button>
   </div>
   <div id="signal-history-view" style="display:none">
     <div class="sig-summary" id="signal-summary"></div>
@@ -1756,6 +1834,7 @@ document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1
 document.getElementById('entry-analysis-btn')?.addEventListener('click',()=>mpD1Call('/api/entry-analysis'));
 document.getElementById('matrix-exit-audit-btn')?.addEventListener('click',()=>mpD1Call('/api/matrix-exit-audit'));
 document.getElementById('entry-path-replay-btn')?.addEventListener('click',()=>mpD1Call('/api/entry-path-replay'));
+document.getElementById('tpsl-path-replay-btn')?.addEventListener('click',()=>mpD1Call('/api/tpsl-path-replay'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1791,7 +1870,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/entry-analysis', '/api/matrix-exit-audit', '/api/entry-path-replay', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/entry-analysis', '/api/matrix-exit-audit', '/api/entry-path-replay', '/api/tpsl-path-replay', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1819,6 +1898,7 @@ export default {
       if (url.pathname === '/api/entry-analysis') return json(await entryAnalysis(env));
       if (url.pathname === '/api/matrix-exit-audit') return json(await matrixExitAudit(env));
       if (url.pathname === '/api/entry-path-replay') return json(await entryPathReplay(env));
+      if (url.pathname === '/api/tpsl-path-replay') return json(await tpSlPathReplay(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
