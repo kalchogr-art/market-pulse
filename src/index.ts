@@ -8,7 +8,7 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.13';
+const VERSION = '1.7.14';
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1155,7 +1155,7 @@ async function paperRun(env:Env){
       actions.push({epic,action:'WAIT',reason:'NO_NEW_QUALIFIED_SIGNAL'});
     }
   }
-  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE_V1713_ONE_QUALIFIED_ONE_OBSERVATION',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,
+  return{success:true,...INFO,module:'PAPER_MATRIX_ENGINE_V1714_ONE_QUALIFIED_ONE_OBSERVATION',config:PAPER_CFG,matrix:PAPER_MATRIX,actions,
     research_rule:'ONE_QUALIFIED_SIGNAL_EVENT_EQUALS_ONE_INDEPENDENT_A_F_OBSERVATION',
     live_strategy_changed:false,trading:'DISABLED',execution:'PAPER_ONLY',broker_orders_sent:false};
 }
@@ -1450,6 +1450,69 @@ async function signalHistory(env:Env){
 }
 
 
+async function matrixExitAudit(env:Env){
+  await ensurePaperSchema(env);
+  const since='2026-09-29T00:00:00Z';
+  const q=await env.DB.prepare(`SELECT
+    t.observation_id,t.variant,t.tp_pct,t.sl_pct,t.status,t.exit_reason,t.entry_price,t.exit_price,
+    t.entry_time,t.exit_time,t.pnl_pct,t.max_favorable_pct,t.max_adverse_pct,
+    o.epic,o.side,o.signal_event_id
+    FROM paper_matrix_trades t
+    JOIN paper_observations o ON o.id=t.observation_id
+    WHERE t.status='CLOSED' AND t.entry_time>=?
+    ORDER BY t.exit_time DESC`).bind(since).all();
+  const rows=(q.results??[]) as Obj[];
+  const reasonCounts:Record<string,number>={};
+  const byVariant:Record<string,Obj>={};
+  const samples:Obj[]=[];
+  const pct=(entry:number,exit:number,side:string)=>{
+    if(!entry||!exit)return null;
+    return (side==='SHORT'?(entry-exit)/entry:(exit-entry)/entry)*100;
+  };
+  for(const r of rows){
+    const reason=String(r.exit_reason??'NULL');
+    reasonCounts[reason]=(reasonCounts[reason]??0)+1;
+    const v=String(r.variant??'?');
+    const g=byVariant[v]??{variant:v,trades:0,reasons:{},tp_target_pct:Number(r.tp_pct??0),sl_target_pct:Number(r.sl_pct??0),
+      avg_recorded_pnl_pct:0,avg_recomputed_pnl_pct:0,avg_tp_overshoot_pct:0,avg_sl_overshoot_pct:0,duration_sum_min:0,
+      tp_like:0,sl_like:0,other:0};
+    g.trades++; g.reasons[reason]=(g.reasons[reason]??0)+1;
+    const entry=Number(r.entry_price??0),exit=Number(r.exit_price??0),side=String(r.side??'');
+    const rp=pct(entry,exit,side), recorded=Number(r.pnl_pct??0);
+    g.avg_recorded_pnl_pct+=recorded; if(rp!=null)g.avg_recomputed_pnl_pct+=rp;
+    const upper=reason.toUpperCase();
+    const tpLike=upper.includes('TP')||upper.includes('TAKE_PROFIT')||upper.includes('TAKE PROFIT');
+    const slLike=upper.includes('SL')||upper.includes('STOP_LOSS')||upper.includes('STOP LOSS');
+    if(tpLike){g.tp_like++; if(rp!=null)g.avg_tp_overshoot_pct+=rp-Number(r.tp_pct??0);}
+    else if(slLike){g.sl_like++; if(rp!=null)g.avg_sl_overshoot_pct+=Math.abs(rp)-Number(r.sl_pct??0);}
+    else g.other++;
+    const et=Date.parse(String(r.entry_time??'')),xt=Date.parse(String(r.exit_time??''));
+    const dur=Number.isFinite(et)&&Number.isFinite(xt)?Math.max(0,(xt-et)/60000):null;
+    if(dur!=null)g.duration_sum_min+=dur;
+    if(samples.length<100)samples.push({
+      observation_id:r.observation_id,signal_event_id:r.signal_event_id,asset:r.epic,side:r.side,variant:v,
+      entry_time:r.entry_time,exit_time:r.exit_time,duration_min:dur==null?null:Math.round(dur*100)/100,
+      exit_reason:reason,entry_price:entry,exit_price:exit,tp_target_pct:Number(r.tp_pct??0),sl_target_pct:Number(r.sl_pct??0),
+      recorded_pnl_pct:recorded,recomputed_pnl_pct:rp==null?null:Math.round(rp*10000)/10000,
+      mfe_pct:Number(r.max_favorable_pct??0),mae_pct:Number(r.max_adverse_pct??0)
+    });
+    byVariant[v]=g;
+  }
+  const variants=Object.values(byVariant).map((g:any)=>({
+    variant:g.variant,trades:g.trades,tp_target_pct:g.tp_target_pct,sl_target_pct:g.sl_target_pct,reasons:g.reasons,
+    tp_like:g.tp_like,sl_like:g.sl_like,other:g.other,
+    avg_recorded_pnl_pct:g.trades?Math.round(g.avg_recorded_pnl_pct/g.trades*10000)/10000:null,
+    avg_recomputed_pnl_pct:g.trades?Math.round(g.avg_recomputed_pnl_pct/g.trades*10000)/10000:null,
+    avg_tp_overshoot_pct:g.tp_like?Math.round(g.avg_tp_overshoot_pct/g.tp_like*10000)/10000:null,
+    avg_sl_overshoot_pct:g.sl_like?Math.round(g.avg_sl_overshoot_pct/g.sl_like*10000)/10000:null,
+    avg_duration_min:g.trades?Math.round(g.duration_sum_min/g.trades*100)/100:null
+  })).sort((a:any,b:any)=>String(a.variant).localeCompare(String(b.variant)));
+  return{success:true,worker:'market-pulse',version:VERSION,module:'MATRIX_EXIT_AUDIT_READ_ONLY',
+    strategy_changed:false,trading:'DISABLED',sample_since:since,closed_trade_rows:rows.length,
+    exact_exit_reason_counts:reasonCounts,by_variant:variants,recent_samples:samples,
+    note:'Audit only: exact stored exit reasons, recorded vs recomputed P/L, duration and TP/SL overshoot where the stored reason can be classified.'};
+}
+
 async function entryAnalysis(env:Env){
   await ensureSignalEventSchema(env); await ensurePaperSchema(env);
   const since='2026-09-29T00:00:00Z';
@@ -1517,7 +1580,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.13 · SHADOW MATRIX RESEARCH</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.14 · MATRIX EXIT AUDIT</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
@@ -1536,6 +1599,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
     <button id="snapshot-status-btn" type="button">⚙️ STATUS</button>
     <button id="signal-history-btn" type="button">🎯 SIGNAL HISTORY</button>
     <button id="entry-analysis-btn" type="button">🧠 SHADOW MATRIX</button>
+    <button id="matrix-exit-audit-btn" type="button">🔬 EXIT AUDIT</button>
   </div>
   <div id="signal-history-view" style="display:none">
     <div class="sig-summary" id="signal-summary"></div>
@@ -1596,6 +1660,7 @@ function renderSignalHistory(data){
 document.getElementById('snapshot-status-btn')?.addEventListener('click',()=>mpD1Call('/api/snapshot-status'));
 document.getElementById('signal-history-btn')?.addEventListener('click',()=>mpD1Call('/api/signal-history'));
 document.getElementById('entry-analysis-btn')?.addEventListener('click',()=>mpD1Call('/api/entry-analysis'));
+document.getElementById('matrix-exit-audit-btn')?.addEventListener('click',()=>mpD1Call('/api/matrix-exit-audit'));
 
 const $=id=>document.getElementById(id);let busy=false,chartRows=[],lastQuoteAt=0;
 const fmt=v=>typeof v==='number'?v.toLocaleString('en-US',{maximumFractionDigits:6,useGrouping:false}):'—';
@@ -1631,7 +1696,7 @@ export default {
       'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer'
     }});
     if (url.pathname === '/health') return json({success: true, ...INFO});
-    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/entry-analysis', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
+    if (!['/api/check', '/api/markets', '/api/diagnostics', '/api/dashboard', '/api/candles', '/api/signal', '/api/news', '/api/snapshot-run', '/api/snapshots', '/api/snapshot-status', '/api/persistence', '/api/paper-run', '/api/paper-status', '/api/signal-history', '/api/signal-history-backfill', '/api/score-distribution', '/api/filter-diagnostic', '/api/repair-qualification', '/api/matrix-gap', '/api/entry-analysis', '/api/matrix-exit-audit', '/api/demo-trading-diagnostic', '/api/demo-order-test', '/api/demo-close-test', '/api/demo-full-cycle'].includes(url.pathname)) return json({success: false, error: 'NOT_FOUND'}, 404);
     if (!env.ADMIN_TOKEN || env.ADMIN_TOKEN.length < 32) return json({success: false, error: 'ADMIN_TOKEN_MISSING_OR_TOO_SHORT'}, 503);
     if (req.headers.get('Authorization') !== 'Bearer ' + env.ADMIN_TOKEN) return json({success: false, error: 'UNAUTHORIZED'}, 401);
     try {
@@ -1657,6 +1722,7 @@ export default {
       if (url.pathname === '/api/repair-qualification') return json(await repairSignalQualifications(env));
       if (url.pathname === '/api/matrix-gap') return json(await qualifiedMatrixGapDiagnostic(env));
       if (url.pathname === '/api/entry-analysis') return json(await entryAnalysis(env));
+      if (url.pathname === '/api/matrix-exit-audit') return json(await matrixExitAudit(env));
       if (url.pathname === '/api/signal-history-backfill') return json(await signalHistoryBackfill(env));
       if (url.pathname === '/api/demo-trading-diagnostic') return json(await demoTradingDiagnostic(env));
       if (url.pathname === '/api/demo-order-test') return json(await demoOrderTest(env));
