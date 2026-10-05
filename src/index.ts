@@ -8,8 +8,8 @@ interface Env {
 }
 type Obj = Record<string, any>;
 const BASE = 'https://demo-api-capital.backend-capital.com/api/v1';
-const VERSION = '1.7.20';
-const NEW_SIGNALS_SINCE = '2026-10-02T00:00:00Z'; // forward-only exact-target research cohort
+const VERSION = '1.7.21';
+const NEW_SIGNALS_SINCE = '2026-10-05T05:00:00Z'; // CLEAN FORWARD RESET — 05.10.2026 08:00 Sofia
 const TIMEOUT_MS = 12000;
 const INFO = {worker: 'market-pulse', version: VERSION, mode: 'DEMO_READ_ONLY', trading_enabled: false};
 
@@ -1194,14 +1194,14 @@ async function paperStatus(env:Env){
   await ensurePaperSchema(env);
   const obs=await env.DB.prepare(`SELECT COUNT(*) total,
     COALESCE(SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END),0) open,
-    COALESCE(SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END),0) closed
+    COALESCE(SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END),0) closed
     FROM paper_observations`).first<Obj>();
   const matrix=await env.DB.prepare(`SELECT variant,COUNT(*) trades,
-    SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
-    SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
-    SUM(CASE WHEN status='CLOSED' AND pnl_pct<=0 THEN 1 ELSE 0 END) losses,
+    SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN t.status='CLOSED' AND t.pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    SUM(CASE WHEN t.status='CLOSED' AND t.pnl_pct<=0 THEN 1 ELSE 0 END) losses,
     ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value,
-    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) expectancy_pct,
+    ROUND(AVG(CASE WHEN t.status='CLOSED' THEN t.pnl_pct END),4) expectancy_pct,
     ROUND(CASE WHEN ABS(SUM(CASE WHEN status='CLOSED' AND pnl_value<0 THEN pnl_value ELSE 0 END))>0
       THEN SUM(CASE WHEN status='CLOSED' AND pnl_value>0 THEN pnl_value ELSE 0 END)/
            ABS(SUM(CASE WHEN status='CLOSED' AND pnl_value<0 THEN pnl_value ELSE 0 END)) END,4) profit_factor,
@@ -1209,10 +1209,10 @@ async function paperStatus(env:Env){
     ROUND(AVG(CASE WHEN status='CLOSED' THEN max_adverse_pct END),4) avg_mae_pct
     FROM paper_matrix_trades GROUP BY variant ORDER BY variant`).all();
   const byAsset=await env.DB.prepare(`SELECT epic,variant,COUNT(*) trades,
-    SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,
-    SUM(CASE WHEN status='CLOSED' AND pnl_pct>0 THEN 1 ELSE 0 END) wins,
+    SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END) closed,
+    SUM(CASE WHEN t.status='CLOSED' AND t.pnl_pct>0 THEN 1 ELSE 0 END) wins,
     ROUND(SUM(CASE WHEN status='CLOSED' THEN pnl_value ELSE 0 END),4) pnl_value,
-    ROUND(AVG(CASE WHEN status='CLOSED' THEN pnl_pct END),4) expectancy_pct
+    ROUND(AVG(CASE WHEN t.status='CLOSED' THEN t.pnl_pct END),4) expectancy_pct
     FROM paper_matrix_trades GROUP BY epic,variant ORDER BY epic,variant`).all();
   const byVol=await env.DB.prepare(`SELECT o.volatility_regime,t.variant,COUNT(*) trades,
     SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END) closed,
@@ -1302,7 +1302,7 @@ async function qualifiedMatrixGapDiagnostic(env:Env){
   await ensureSignalEventSchema(env); await ensurePaperSchema(env);
   const er=await env.DB.prepare(`SELECT id,epic,side,start_time,entry_price,entry_score,persistence_score,regime_streak,acceleration,qualified,qualification_reason FROM signal_events ORDER BY start_time DESC`).all();
   const or=await env.DB.prepare(`SELECT id,epic,side,status,entry_time,entry_price,entry_combined_score FROM paper_observations ORDER BY entry_time DESC`).all();
-  const tr=await env.DB.prepare(`SELECT observation_id,COUNT(*) variants,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open_variants,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed_variants FROM paper_matrix_trades GROUP BY observation_id`).all();
+  const tr=await env.DB.prepare(`SELECT observation_id,COUNT(*) variants,SUM(CASE WHEN status='OPEN' THEN 1 ELSE 0 END) open_variants,SUM(CASE WHEN t.status='CLOSED' THEN 1 ELSE 0 END) closed_variants FROM paper_matrix_trades GROUP BY observation_id`).all();
   const events=(er.results??[]) as Obj[], obs=(or.results??[]) as Obj[], trades=(tr.results??[]) as Obj[];
   const tmap=new Map(trades.map(x=>[String(x.observation_id),x]));
   const qualified=events.filter(x=>Number(x.qualified)===1);
@@ -1800,7 +1800,7 @@ const PAGE = `<!doctype html><html lang="bg"><head><meta charset="utf-8"><meta n
 <style>
 :root{color-scheme:dark;font-family:system-ui,sans-serif;background:#0b1320;color:#e5edf7}*{box-sizing:border-box}body{max-width:1180px;margin:0 auto;padding:24px}header{display:flex;justify-content:space-between;gap:12px;align-items:center}h1{margin:0;font-size:28px}h2{font-size:19px;margin:0 0 14px}.muted,small{color:#9cb0c7}.badge{color:#85e4bd;border:1px solid #285947;padding:7px 10px;border-radius:20px;font-size:12px}.panel{background:#111e30;border:1px solid #24374d;border-radius:14px;padding:18px;margin-top:18px}.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center}input,button,select{font:inherit;border:1px solid #36506b;border-radius:8px;padding:10px;background:#16273b;color:#e5edf7}input[type=password]{flex:1;min-width:180px}button{cursor:pointer;background:#79dcb4;color:#09231b;font-weight:650}button.secondary{background:#1b3048;color:#dce8f5}button:disabled{opacity:.5;cursor:wait}label{font-size:14px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin-top:16px}.card{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:16px}.card h3{margin:0 0 6px;font-size:17px}.price{font-size:22px;font-variant-numeric:tabular-nums;margin:14px 0}.good{color:#85e4bd}.warn{color:#ffcf7a}.bad{color:#ff959d}canvas{width:100%;height:300px;display:block;margin-top:14px;background:#0d1929;border-radius:8px}.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:13px;white-space:nowrap}td,th{text-align:right;padding:9px;border-bottom:1px solid #263a52}td:first-child,th:first-child{text-align:left}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:460px;overflow:auto;font-size:12px}#message{min-height:24px;margin:12px 0 0}.sig-summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin:14px 0}.sig-stat{background:#142439;border:1px solid #2c435d;border-radius:10px;padding:12px}.sig-stat b{display:block;font-size:20px;margin-top:4px}.sig-card{border:1px solid #2c435d;border-radius:10px;padding:14px;margin:10px 0;background:#142439}.sig-top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}.sig-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px;font-size:13px;color:#9cb0c7}details{margin-top:16px}summary{cursor:pointer}@media(max-width:500px){body{padding:14px}.panel{padding:12px}header{align-items:flex-start}.grid{grid-template-columns:1fr}h1{font-size:24px}}
 </style></head><body>
-<header><div><h1>Market Pulse</h1><small>V1.7.20 · SIGNAL HISTORY SQL FIX</small></div><span class="badge">DEMO · READ ONLY</span></header>
+<header><div><h1>Market Pulse</h1><small>V1.7.21 · CLEAN FORWARD RESET</small></div><span class="badge">DEMO · READ ONLY</span></header>
 <p class="muted">Пет пазара · котировки и исторически свещи · търговията е изключена</p>
 <section class="panel"><label for="token">ADMIN_TOKEN</label><div class="bar"><input id="token" type="password" autocomplete="off" placeholder="Токенът на Market Pulse"><button id="refresh">Обнови пазарите</button><button class="secondary" id="clear">Изчисти</button></div><small>Токенът остава само в това поле. Не въвеждай Capital.com API ключ.</small>
 <div class="bar" style="margin-top:12px"><label><input type="checkbox" id="auto"> Котировки през 30 секунди</label><button class="secondary" id="diagnostics">Диагностика</button><button class="secondary" id="accounts">Акаунти</button></div><p id="message" role="status">Въведи токена и обнови пазарите.</p></section>
